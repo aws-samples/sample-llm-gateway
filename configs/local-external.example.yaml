@@ -1,0 +1,20 @@
+# 本地验证外接 API 供应商用的最小配置：不需要 AWS 凭证，控制面用 mock，凭证走环境变量。
+# 用法见 docs/operations.md「本地验证外接 API 供应商」。
+server:
+  listen: ":8080"
+  log_level: info
+control_plane:
+  base_url: "http://127.0.0.1:9090"
+  allow_insecure: true   # 本地 mock 控制面走明文 http，必须显式允许；接真控制面用 https 后删掉
+  token: "mock-token"
+providers:
+  moonshot:                              # OpenAI 兼容格式的供应商：只声明它有的协议
+    auth: bearer
+    api_key: "${MOONSHOT_API_KEY}"
+    endpoints:
+      openai_chat: "https://api.moonshot.ai/v1"
+  # anthropic:                           # Anthropic 格式的供应商挂 anthropic 协议；官方 API 不对部分地区开放，本机直连不通就换出口
+  #   auth: x-api-key
+  #   api_key: "${ANTHROPIC_API_KEY}"
+  #   endpoints:
+  #     anthropic: "https://api.anthropic.com/v1"

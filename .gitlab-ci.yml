@@ -1,0 +1,78 @@
+# 单测 + 构建 + GitLab 自带安全扫描（SAST / Secret Detection / 依赖扫描）
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+stages:
+  - test
+  - build
+
+variables:
+  GOFLAGS: "-mod=mod"
+  GOPROXY: "https://proxy.golang.org,direct"
+  SAST_EXCLUDED_PATHS: "bin"
+
+.go-base:
+  image: golang:1.26
+  cache:
+    key: go-mod
+    paths:
+      - .go/pkg/mod
+    unprotect: true   # main 与 MR 分支共用一份模块缓存，MR 首跑不再报 cache 不存在；模块内容由 go.sum 校验，共享无篡改风险
+  variables:
+    GOPATH: "$CI_PROJECT_DIR/.go"
+
+unit-test:
+  extends: .go-base
+  stage: test
+  script:
+    - go vet ./...
+    - go test -race ./... -count=1   # -race 必带：路由选择在每个请求 goroutine 里跑，竞态只有它能抓到
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Go 官方漏洞库扫描：只报实际可达的漏洞函数，比依赖扫描噪音小
+govulncheck:
+  extends: .go-base
+  stage: test
+  script:
+    - go install golang.org/x/vuln/cmd/govulncheck@latest
+    - $GOPATH/bin/govulncheck ./...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build:
+  extends: .go-base
+  stage: build
+  script:
+    - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/gateway ./cmd/gateway
+    - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/mock-controlplane ./cmd/mock-controlplane
+  artifacts:
+    paths: [bin/]
+    expire_in: 2 weeks
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# 报告同时作为普通工件上传，便于用 API 拉下来看明细（reports 类工件 API 下不到）。
+# 两个扫描 job 日志里的 `.gitlab/*-ruleset.toml not found, ruleset customization will be disabled` 是分析器没有项目级
+# 规则定制时的固定输出，GitLab 官方仓库同样会打；规则定制是 Ultimate 功能，本实例放了文件也只会变成
+# `ruleset customization not enabled`（2026-09-08 实测），所以不放。误报一律用行内 nosemgrep 注释压。
+# 依赖扫描模板在本实例需要 Ultimate 授权，未生成 job；Go 依赖漏洞由上面的 govulncheck 覆盖。
+semgrep-sast:
+  artifacts:
+    paths: [gl-sast-report.json]
+    reports:
+      sast: gl-sast-report.json
+    expire_in: 2 weeks
+
+secret_detection:
+  artifacts:
+    paths: [gl-secret-detection-report.json]
+    reports:
+      secret_detection: gl-secret-detection-report.json
+    expire_in: 2 weeks

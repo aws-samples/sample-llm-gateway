@@ -1,0 +1,107 @@
+# 客户控制面的替身，正式部署时删掉。
+# 路由表：前四个模型走东京 Bedrock（本账号，东京 VPC Endpoint）；带 -us 后缀的走 us-west-2 的跨账号 provider
+# （VPC peering → us-west-2 Bedrock VPCE，AssumeRole 到 Bedrock 账号）；claude-sonnet-5-ha 演示两级优先级故障转移。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-controlplane-routes
+  namespace: llm-gateway
+data:
+  routes.json: |
+    {
+      "version": "poc-xacct-1",
+      "models": [
+        {"modelCode": "claude-sonnet-5", "providers": [{"providerCode": "bedrock", "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 10, "weight": 100}]},
+        {"modelCode": "claude-opus-5",   "providers": [{"providerCode": "bedrock", "providerModelCode": "global.anthropic.claude-opus-5",   "priority": 10, "weight": 100}]},
+        {"modelCode": "gpt-5.6-sol",     "providers": [{"providerCode": "bedrock", "providerModelCode": "global.openai.gpt-5.6-sol",        "priority": 10, "weight": 100}]},
+        {"modelCode": "gpt-5.6-luna",    "providers": [{"providerCode": "bedrock", "providerModelCode": "global.openai.gpt-5.6-luna",       "priority": 10, "weight": 100}]},
+        {"modelCode": "claude-sonnet-5-us", "providers": [{"providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 10, "weight": 100}]},
+        {"modelCode": "claude-opus-5-us",   "providers": [{"providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.anthropic.claude-opus-5",   "priority": 10, "weight": 100}]},
+        {"modelCode": "gpt-5.6-sol-us",     "providers": [{"providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.openai.gpt-5.6-sol",        "priority": 10, "weight": 100}]},
+        {"modelCode": "gpt-5.6-luna-us",    "providers": [{"providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.openai.gpt-5.6-luna",       "priority": 10, "weight": 100}]},
+        {"modelCode": "claude-sonnet-5-ha", "providers": [
+          {"providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 10, "weight": 100},
+          {"providerCode": "bedrock",            "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 20, "weight": 100}
+        ]}
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-controlplane
+  namespace: llm-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mock-controlplane }
+  template:
+    metadata:
+      labels: { app: mock-controlplane }
+    spec:
+      nodeSelector: { network-tier: private }
+      automountServiceAccountToken: false      # 不访问 K8s API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: mock-controlplane
+          # tag@digest 双写：digest 决定拉哪个构建，tag 只是给人看的；发新版两处一起改，digest 取 ko 输出
+          image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/sample-llm-gateway/mock-controlplane:v0.6.1@sha256:3851f4ca2801b8feb07d588bb71cfeffcc3dbfe76100cf1eb288c1abfb094fe9
+          imagePullPolicy: Always
+          # token 与合法 key 从挂载的 Secret 文件读取，不经环境变量
+          args: ["-listen", ":9090", "-routes", "/etc/mock-controlplane/routes.json",
+                 "-token-file", "/etc/mock-controlplane/secrets/CP_GATEWAY_TOKEN",
+                 "-keys-file", "/etc/mock-controlplane/secrets/MOCK_API_KEYS"]
+          ports: [{ containerPort: 9090, name: http }]
+          volumeMounts:
+            - { name: routes, mountPath: /etc/mock-controlplane, readOnly: true }
+            - { name: secrets, mountPath: /etc/mock-controlplane/secrets, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /admin/healthCheck, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /admin/healthCheck, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 128Mi }   # 整数核：小数核会被 CFS 按配额限流（semgrep no-fractional-cpu-limits）
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: routes
+          configMap: { name: mock-controlplane-routes }
+        - name: secrets
+          secret: { secretName: llm-gateway-secrets }
+---
+# mock 控制面只接受集群内 Pod（网关、k6）和节点地址（kubectl port-forward 的流量从节点发出）的 9090 入向，自身不外联。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mock-controlplane
+  namespace: llm-gateway
+spec:
+  podSelector:
+    matchLabels: { app: mock-controlplane }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+        - ipBlock: { cidr: 10.0.0.0/8 }
+      ports:
+        - { protocol: TCP, port: 9090 }
+  egress: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-controlplane
+  namespace: llm-gateway
+spec:
+  selector: { app: mock-controlplane }
+  ports: [{ port: 9090, targetPort: 9090 }]

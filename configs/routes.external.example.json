@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "modelCode": "kimi",
+      "providers": [
+        { "providerCode": "moonshot", "providerModelCode": "kimi-k2.5", "priority": 1, "weight": 100 }
+      ]
+    }
+  ]
+}

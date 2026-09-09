@@ -1,0 +1,31 @@
+# PoC 用的 eksctl 集群规格：EKS Auto Mode（不用管节点组），开 OIDC 供 IRSA 使用。
+# 复用已有 VPC。下面的 VPC / 子网 ID、publicAccessCIDRs、owner 标签都是占位，换成自己的。
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: llm-gateway-poc
+  region: ap-northeast-1
+  version: "1.35"
+  tags:
+    project: sample-llm-gateway
+    owner: <owner>
+iam:
+  withOIDC: true
+autoModeConfig:
+  enabled: true
+  nodePools: ["general-purpose", "system"]
+vpc:
+  id: vpc-xxxxxxxxxxxxxxxxx
+  subnets:
+    private:
+      ap-northeast-1a: { id: subnet-aaaaaaaaaaaaaaaaa }
+      ap-northeast-1c: { id: subnet-bbbbbbbbbbbbbbbbb }
+    public:
+      ap-northeast-1a: { id: subnet-ccccccccccccccccc }
+      ap-northeast-1c: { id: subnet-ddddddddddddddddd }
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+  publicAccessCIDRs: ["<your-egress-ip>/32"]
+accessConfig:
+  authenticationMode: API_AND_CONFIG_MAP

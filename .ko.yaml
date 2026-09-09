@@ -1,0 +1,9 @@
+# ko 构建配置。基础镜像取自 Amazon ECR Public（自带 CA 证书，无 shell）。
+defaultBaseImage: public.ecr.aws/amazonlinux/amazonlinux:2023-minimal
+builds:
+  - id: gateway
+    main: ./cmd/gateway
+    ldflags: ["-s", "-w"]
+  - id: mock-controlplane
+    main: ./cmd/mock-controlplane
+    ldflags: ["-s", "-w"]

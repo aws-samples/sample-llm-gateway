@@ -1,0 +1,69 @@
+# k6 压测 Job：与网关同集群、不同节点（反亲和），直接打 Service，不经过 port-forward。
+# 先 kubectl create configmap k6-script --from-file=loadtest/k6-bedrock.js -n llm-gateway，再 apply 本文件。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-loadtest
+  namespace: llm-gateway
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: k6-loadtest }
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector: { network-tier: private }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: llm-gateway } }
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 12345       # grafana/k6 镜像自带的非 root 用户
+        runAsGroup: 12345
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: k6
+          image: grafana/k6:1.1.0@sha256:aa8202f377550cee0c8bad295bbe8d2d4d4cf88d15c98383e9ecc53c56882308
+          imagePullPolicy: Always
+          args: ["run", "/scripts/k6-bedrock.js", "--summary-export", "/dev/stdout"]
+          env:
+            - { name: GW, value: "http://llm-gateway.llm-gateway.svc.cluster.local:8080" }
+            - { name: KEY, value: "sk-demo-key" }   # mock 控制面接受的演示 key，正式环境换成控制面签发的 key
+            - { name: TARGET_RPS, value: "20" }
+            - { name: HOLD, value: "3m" }
+          volumeMounts:
+            - { name: script, mountPath: /scripts, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: script
+          configMap: { name: k6-script }
+        - name: tmp
+          emptyDir: {}
+---
+# k6 只需要打集群内的网关 Service：出向放行 VPC 内地址与 Service CIDR，不收任何入向。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k6-loadtest
+  namespace: llm-gateway
+spec:
+  podSelector:
+    matchLabels: { app: k6-loadtest }
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/8 }
+        - ipBlock: { cidr: 172.20.0.0/16 }

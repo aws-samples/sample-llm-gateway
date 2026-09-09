@@ -1,0 +1,76 @@
+# sample-llm-gateway 配置样例。${VAR} 会从环境变量展开。
+#
+# 密钥字段（control_plane.token、providers.*.api_key、providers.*.external_id）有两种存法：
+#   明文            直接写值，或写 ${VAR} 从环境变量（K8s Secret）注入
+#   Secrets Manager 写 "secretsmanager://<secret 名或 ARN>[#<JSON 键>]"，启动时用 AWS 默认凭证链（EKS 上即 IRSA）
+#                   取 AWSCURRENT 版本；不带 #键 取整个 SecretString，带 #键 要求 SecretString 是 JSON 对象。
+#                   两种写法可以混用；取不到、键不存在、值为空都会启动失败。密钥轮转后滚动重启生效。
+server:
+  listen: ":8080"
+  read_timeout: 60s                    # 读完请求头 + 请求体的时限，防慢发 body 占连接；不约束响应
+  shutdown_timeout: 280s               # SIGTERM 后等在途请求的时间，= terminationGracePeriodSeconds 减 20 秒
+  request_timeout: 10m                 # 单个请求（含流式）的硬上限
+  upstream_connect_timeout: 5s
+  upstream_response_header_timeout: 5m # 推理模型首字可能很慢，给足首包等待时间
+  max_request_body_bytes: 33554432     # 32 MiB
+  max_failover_attempts: 3
+  log_level: info
+
+control_plane:
+  base_url: "${CP_BASE_URL}"           # 生产请用 https；token 与客户 key 每次调用都随行，明文 http 会泄露
+  allow_insecure: true                 # 仅当 base_url 为 http 时才需要（本地/集群内 mock）；接真控制面用 https 后请删掉本行
+  token: "${CP_GATEWAY_TOKEN}"         # 三个网关接口统一带 X-HIGRESS-Token 头
+  key_auth_timeout: 2s                 # fail-closed：闸门不可达直接 503
+  report_timeout: 5s
+  routes_poll_interval: 30s            # 带 If-None-Match 轮询 model-routes
+
+metering:
+  queue_size: 10000
+  workers: 4
+  max_retries: 5
+
+secrets:                               # 只在有 secretsmanager:// 引用时才会用到
+  region: ap-northeast-1               # 默认依次取 AWS_REGION、AWS_DEFAULT_REGION
+  # endpoint: "https://vpce-xxxx-yyyy.secretsmanager.ap-northeast-1.vpce.amazonaws.com"  # 可选，VPC Endpoint 私有 DNS 关闭时填专属域名（必须 https）
+  timeout: 10s                         # 单次 GetSecretValue 超时
+
+providers:
+  bedrock:
+    auth: aws_iam                      # AWS 默认凭证链；EKS 上即 IRSA
+    region: ap-northeast-1
+    endpoints:                         # 按进入的协议选 base URL
+      openai_chat:      "https://bedrock-runtime.ap-northeast-1.amazonaws.com/openai/v1"
+      openai_responses: "https://bedrock-runtime.ap-northeast-1.amazonaws.com/openai/v1"
+      anthropic:        "https://bedrock-runtime.ap-northeast-1.amazonaws.com/anthropic/v1"
+  # 跨区域 + 跨账号 + 全私网的 Bedrock 示例（EKS IRSA 身份 → AssumeRole 到 Bedrock 账号 → 对 us-west-2 签名）：
+  #   region      SigV4 签名区域，就是 Bedrock 端点所在区域
+  #   sts_region  STS 调用（IRSA 换凭证 + AssumeRole）固定走的区域；默认取 AWS_REGION。网关跑在东京、端点在美西时
+  #               必须填东京，这样 STS 才会命中东京 VPC 的 STS VPC Endpoint 而不是 us-west-2 公网
+  #   role_arn    可选，跨账号角色；对端信任策略要允许本网关的 IRSA 角色 sts:AssumeRole
+  #   external_id 可选，对端要求 ExternalId 时填
+  #   endpoints   VPC Endpoint 的私有 DNS 只在同一 VPC 内生效，经 peering 访问别的区域时要写 VPCE 专属域名
+  # bedrock-usw2-xacct:
+  #   auth: aws_iam
+  #   region: us-west-2
+  #   sts_region: ap-northeast-1
+  #   role_arn: arn:aws:iam::<bedrock-account>:role/<cross-account-role>
+  #   endpoints:
+  #     anthropic:        "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/anthropic/v1"
+  #     openai_chat:      "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
+  #     openai_responses: "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
+  openai:
+    auth: bearer
+    api_key: "secretsmanager://llm-gateway/prod#OPENAI_API_KEY"   # 从 JSON secret 里取一个键
+    endpoints:
+      openai_chat:      "https://api.openai.com/v1"
+      openai_responses: "https://api.openai.com/v1"
+  anthropic:
+    auth: x-api-key
+    api_key: "secretsmanager://llm-gateway/anthropic-api-key"     # 整个 SecretString 就是 key
+    endpoints:
+      anthropic:        "https://api.anthropic.com/v1"
+  moonshot:
+    auth: bearer
+    api_key: "${MOONSHOT_API_KEY}"                                # 明文方式：从环境变量注入
+    endpoints:
+      openai_chat:      "https://api.moonshot.ai/v1"

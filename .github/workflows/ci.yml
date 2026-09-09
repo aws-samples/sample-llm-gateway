@@ -1,0 +1,21 @@
+# 单测 + govulncheck + 构建。与 .gitlab-ci.yml 同一套检查，GitHub 侧的 CodeQL / Dependabot 由仓库设置提供。
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./... -count=1   # -race 必带：路由选择在每个请求 goroutine 里跑，竞态只有它能抓到
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+      - run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/gateway ./cmd/gateway
+      - run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/mock-controlplane ./cmd/mock-controlplane

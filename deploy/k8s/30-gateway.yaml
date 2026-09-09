@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-gateway-config
+  namespace: llm-gateway
+data:
+  gateway.yaml: |
+    server:
+      listen: ":8080"
+      log_level: info
+    control_plane:
+      base_url: "http://mock-controlplane.llm-gateway.svc.cluster.local:9090"
+      # 控制面 token 存在 AWS Secrets Manager（JSON secret llm-gateway/poc 的 CP_GATEWAY_TOKEN 键），启动时经 IRSA 读取。
+      # 走东京 VPC 内的 secretsmanager VPC Endpoint，IAM 见 deploy/eks/secrets-read-policy.json。
+      # 明文方式则写 token: "${CP_GATEWAY_TOKEN}" 并在下面 env 里从 K8s Secret 注入。
+      token: "secretsmanager://llm-gateway/poc#CP_GATEWAY_TOKEN"
+      allow_insecure: true   # base_url 是集群内 mock 控制面的 http，显式允许明文；接真控制面改 https 后删掉
+      routes_poll_interval: 30s
+    secrets:
+      region: ap-northeast-1
+    providers:
+      # 本账号、东京。域名由东京 VPC 内的 bedrock-runtime VPC Endpoint 私有 DNS 解析成 10.2.x，不出公网。
+      bedrock:
+        auth: aws_iam
+        region: ap-northeast-1
+        endpoints:
+          openai_chat:      "https://bedrock-runtime.ap-northeast-1.amazonaws.com/openai/v1"
+          openai_responses: "https://bedrock-runtime.ap-northeast-1.amazonaws.com/openai/v1"
+          anthropic:        "https://bedrock-runtime.ap-northeast-1.amazonaws.com/anthropic/v1"
+      # 跨区域 + 跨账号：IRSA 身份先 AssumeRole 到 Bedrock 账号（下面的 111122223333 是占位）的角色，再对 us-west-2 签名；
+      # 请求经 VPC peering 打到 us-west-2 VPC 里的 Bedrock VPCE（私有 DNS 不跨 VPC，所以要写 VPCE 专属域名）；
+      # STS 固定走东京（sts_region），命中东京 VPC 的 STS VPC Endpoint。
+      bedrock-usw2-xacct:
+        auth: aws_iam
+        region: us-west-2
+        sts_region: ap-northeast-1
+        role_arn: arn:aws:iam::111122223333:role/bedrock-cross-account-role
+        endpoints:
+          openai_chat:      "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
+          openai_responses: "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
+          anthropic:        "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/anthropic/v1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: llm-gateway }
+  template:
+    metadata:
+      labels: { app: llm-gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: llm-gateway
+      automountServiceAccountToken: false   # 网关不访问 K8s API；IRSA 的 aws-iam-token 由 EKS webhook 单独注入，不受此项影响
+      # 收到 SIGTERM 后网关先把 /readyz 置 503 等 5 秒，再等在途请求最多 server.shutdown_timeout（默认 280 秒），
+      # 最后用 10 秒刷计量队列，合计不超过这里的 300 秒。流式回答常超过 30 秒，默认的 30 秒会在每次发版时切断它们。
+      terminationGracePeriodSeconds: 300
+      nodeSelector: { network-tier: private }   # 只跑在私有子网节点池（deploy/k8s/05-network.yaml）
+      # 两副本必须落在不同节点（硬约束），并尽量分布到不同可用区（软约束，只有一个可用区有节点时仍可调度）。
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: llm-gateway } }
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: llm-gateway } }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          # tag@digest 双写：digest 决定拉哪个构建，tag 只是给人看的；发新版两处一起改，digest 取 ko 输出。
+          # 钉 digest 后同 tag 重推也不会误用节点缓存的旧层，imagePullPolicy 仍保留 Always。
+          image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/sample-llm-gateway/gateway:v0.6.1@sha256:850f4ef57d82478720ec903277489a7ef2525f26ae866aa5b0f355ecd26e9df5
+          imagePullPolicy: Always
+          args: ["-config", "/etc/llm-gateway/gateway.yaml"]
+          # 密钥全部走 Secrets Manager，网关容器不再需要从 K8s Secret 注入环境变量
+          ports: [{ containerPort: 8080, name: http }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/llm-gateway, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            # 请求体在鉴权前整体读入内存，limit 至少要容得下「并发上传数 × max_request_body_bytes（默认 32 MiB）」。
+            # 1Gi 约能同时承受 30 个满体积请求，多模态大附件场景按实际并发再抬。
+            # CPU limit 给足余量（request 的 20 倍），只防单副本失控占满节点；转发是 IO 密集型，正常不会碰到。
+            limits: { cpu: "2", memory: 1Gi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: llm-gateway-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+spec:
+  type: ClusterIP
+  selector: { app: llm-gateway }
+  ports: [{ port: 8080, targetPort: http, name: http }]
+---
+# 节点维护、Auto Mode 整合节点时，任何时刻至少保留一个副本在服务。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: llm-gateway }

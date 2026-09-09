@@ -1,0 +1,88 @@
+# 私网专用节点池 + 网络策略。目标：网关 Pod 只落私有子网，出向只允许 VPC 内地址（VPC Endpoint / peering / 集群内），公网一律拒绝。
+#
+# 1) 开启 EKS Auto Mode 的 Network Policy 控制器（默认关闭，只能靠这个 ConfigMap 打开）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amazon-vpc-cni
+  namespace: kube-system
+data:
+  enable-network-policy-controller: "true"
+---
+# 2) 只选私有子网的 NodeClass。role / securityGroup 与集群默认 NodeClass 一致（eksctl 建集群时生成），
+#    subnetSelectorTerms 只保留两个私有子网，路由表里有到 us-west-2 的 peering 路由。role / 安全组 / 子网 ID 都是占位，按 `kubectl get nodeclass default -o yaml` 的值填。
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: private-only
+spec:
+  role: eksctl-llm-gateway-poc-cluster-AutoModeNodeRole-XXXXXXXXXXXX
+  securityGroupSelectorTerms:
+    - id: sg-xxxxxxxxxxxxxxxxx
+  subnetSelectorTerms:
+    - id: subnet-aaaaaaaaaaaaaaaaa   # 10.2.10.0/24 ap-northeast-1a
+    - id: subnet-bbbbbbbbbbbbbbbbb   # 10.2.11.0/24 ap-northeast-1c
+  snatPolicy: Random
+  networkPolicy: DefaultAllow          # 放行默认流量，由下面的 NetworkPolicy 显式收紧网关 Pod
+  networkPolicyEventLogs: Enabled      # 拒绝事件写到节点 /var/log/aws-routed-eni/network-policy-agent.log，排障用
+  ephemeralStorage:
+    size: 80Gi
+    iops: 3000
+    throughput: 125
+---
+# 3) 使用上述 NodeClass 的节点池；网关和 mock 控制面用 nodeSelector 钉到这里。
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: private
+spec:
+  template:
+    metadata:
+      labels:
+        network-tier: private
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: private-only
+      requirements:
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: eks.amazonaws.com/instance-generation
+          operator: Gt
+          values: ["4"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      terminationGracePeriod: 5m
+  limits:
+    cpu: "16"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+---
+# 4) 网关 Pod 出向白名单：只允许 RFC1918 的 10/8（东京 VPC 10.2/16 的各 VPC Endpoint、peering 对端 10.1/16 的 Bedrock VPCE、集群内 Pod）
+#    和集群 Service CIDR 172.20/16（控制面 Service、CoreDNS）。任何公网 IP（bedrock-runtime / sts 的公网解析结果等）都被丢弃。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-gateway-egress-private-only
+  namespace: llm-gateway
+spec:
+  podSelector:
+    matchLabels: { app: llm-gateway }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/8 }
+      ports:
+        - { protocol: TCP, port: 443 }   # Bedrock / STS VPC Endpoint
+        - { protocol: TCP, port: 9090 }  # mock 控制面 Pod
+        - { protocol: UDP, port: 53 }    # CoreDNS Pod（Service 地址 DNAT 后）
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock: { cidr: 172.20.0.0/16 }  # 集群 Service CIDR

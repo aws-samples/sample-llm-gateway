@@ -1,0 +1,12 @@
+/bin/
+/configs/gateway.yaml
+/configs/*.local.yaml
+*.test
+.DS_Store
+.ko.yaml.local
+
+# 客户提供的控制面契约（.http 用例、OpenAPI），只留本地，不进仓库
+/.local/
+
+# 本地代码审查工作清单，不进仓库（评审结论放 MR 描述）
+/CODE-REVIEW.md
