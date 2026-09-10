@@ -1,240 +1,365 @@
-# sample-llm-gateway
+# Sample LLM Gateway
 
-> A deliberately thin LLM pass-through gateway in Go: OpenAI Chat / Responses and Anthropic Messages in, the same protocol out, with Amazon Bedrock over SigV4 / IRSA (cross-region, cross-account, fully private) or any HTTP model provider behind it. Auth, quota and metering are delegated to an existing control plane through three HTTP endpoints. Documentation is in Chinese.
+A lightweight, protocol-preserving large language model (LLM) gateway written in Go. This sample shows how to connect OpenAI- and Anthropic-compatible clients to Amazon Bedrock or other compatible HTTP providers while keeping authentication, quotas, and billing in an existing control plane.
 
-一个刻意做得很薄的 LLM 转发器，Go 编写，交付给已有「模型网关控制面」的团队使用。它位于 OpenAI / Anthropic SDK
-客户端与模型供应商之间：供应商可以是 Amazon Bedrock（IAM 原生鉴权，支持跨区域、跨账号、全私网），也可以是任何
-HTTP 形态的模型服务（OpenAI、Anthropic、Moonshot、各类 MaaS）。鉴权、额度、计量都交给已有控制面，网关通过三个
-HTTP 接口与之对接。
+The gateway implements the request-forwarding layer, not a complete model management platform. It integrates with your control plane through three HTTP endpoints for model routes, authorization, and usage reporting. A mock control plane is included for development and testing.
 
-网关**不做协议转换**：以 OpenAI Chat Completions 进来的请求，以 OpenAI Chat Completions 出去；`/v1/messages` 进来
-就以 Anthropic Messages 出去。网关对请求和响应的全部改动见 [网关改了什么](#网关改了什么)。
+> **Sample code:** Use a development or test environment. This project is not a production-ready service. Review the [security considerations](#security-considerations), [known limitations](#known-limitations), and [costs](#costs) before deploying it.
 
+## Contents
+
+- [Architecture and scope](#architecture-and-scope)
+- [Prerequisites](#prerequisites)
+- [Getting started](#getting-started)
+- [Control plane integration](#control-plane-integration)
+- [Request and response handling](#request-and-response-handling)
+- [Deployment on Amazon EKS](#deployment-on-amazon-eks)
+- [Observability](#observability)
+- [Testing](#testing)
+- [Security considerations](#security-considerations)
+- [Known limitations](#known-limitations)
+- [Costs](#costs)
+- [Clean up](#clean-up)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+
+## Architecture and scope
+
+```text
+Clients
+  POST /v1/chat/completions ---+
+  POST /v1/responses ---------+--> LLM gateway --> Amazon Bedrock (SigV4)
+  POST /v1/messages ----------+        |       --> Compatible HTTP providers
+                                      |
+                                      +--> Your control plane
+                                           - Model routes
+                                           - Authorization and quotas
+                                           - Usage reporting
 ```
-客户端 ──▶ /v1/chat/completions ─┐                       ┌─▶ bedrock-runtime（SigV4，IRSA，可跨账号/跨区域/VPC Endpoint）
-           /v1/responses         ├─▶ sample-llm-gateway ─┼─▶ api.openai.com（Bearer）
-           /v1/messages          ┘         │  ▲          └─▶ 任意 OpenAI / Anthropic 兼容的 HTTP 端点
-                                           ▼  │
-                               控制面：model-routes / key-auth / usage-report
-```
 
-## 文档导航
+The gateway preserves the incoming protocol: Chat Completions requests go to a Chat Completions endpoint, Responses requests to a Responses endpoint, and Messages requests to a Messages endpoint. It does not translate between these APIs or call the Amazon Bedrock Converse API.
 
-| 文档 | 读者 | 内容 |
-| --- | --- | --- |
-| 本文 | 先读 | 定位与边界、请求链路、快速开始、日常运维改动落在哪一层、目录结构 |
-| [docs/configuration.md](docs/configuration.md) | 部署与运维 | 配置文件全部字段、默认值、环境变量展开规则 |
-| [docs/control-plane.md](docs/control-plane.md) | 控制面开发 | 三个接口的请求响应、拒绝原因到 HTTP 状态码的映射、usage 字段口径 |
-| [docs/operations.md](docs/operations.md) | 运维 | 加模型、加供应商、升级回滚、监控指标、日志字段、故障排查 |
-| [docs/private-networking.md](docs/private-networking.md) | 网络与安全 | 跨区域、跨账号、VPC Endpoint 全私网部署，PoC 实测结果 |
-| [docs/robustness-report.md](docs/robustness-report.md) | 上线评审 | 故障注入与并发测试的场景、结果、发现的问题与加固建议 |
-| [CHANGELOG.md](CHANGELOG.md) | 全部 | 各版本变更、升级注意事项 |
+The gateway provides:
 
-## 定位与边界
+- API key authorization through your control plane, including its decisions on model access, rate limits, and quotas.
+- Dynamic route updates, priority-based routing, and weighted candidate selection within each priority tier.
+- Provider authentication using `aws_iam`, `bearer`, `x-api-key`, or `none`.
+- Streaming response relay and failover for eligible errors before committing to a response.
+- Asynchronous token usage reporting with a bounded in-memory queue and retries.
+- Health checks, Prometheus metrics, structured JSON logs, and a model listing endpoint.
 
-网关负责的事：
+For Amazon Bedrock, the gateway signs requests with AWS Signature Version 4 (SigV4) using the AWS SDK default credential chain. Optional AWS Security Token Service (AWS STS) role assumption supports cross-account access. Configurable endpoints support cross-Region and private connectivity when the required IAM and networking resources are in place.
 
-- 识别三种入口协议，取出客户 key 和 `model`，向控制面做一次合并鉴权（key、模型白名单、RPM/TPM、额度）。
-- 按控制面下发的路由表选供应商，把 `model` 改成供应商侧模型码，注入供应商凭证，原样转发。
-- 首个响应字节之前的失败自动切到下一个候选供应商。
-- 从响应（含 SSE 流）里解析 token 用量，归一后异步上报控制面。
-- 暴露 Prometheus 指标、JSON 日志、健康检查、`/v1/models`。
+The gateway does not issue API keys, calculate prices, deduct quotas, persist usage records, or provide a management UI. It does not create a public ingress endpoint. These responsibilities remain with your control plane and deployment infrastructure.
 
-网关不负责的事，原因各不相同：
+## Prerequisites
 
-- 不发 key、不存 key、不算钱、不做额度扣减。这些控制面已经有了，`key-auth` 返回放行即放行，网关不再做二次判断。
-- 不做协议转换、不改请求字段、不补默认参数。这是第一阶段的产品决定，客户端需自行满足所选模型的字段要求。
-- 不做流中重试。流一旦开始客户端已经收到部分内容，重试会造成重复输出和重复计费，所以上游错误原样透传。
-- 不持久化计量。进程内队列加重试，崩溃会丢队列里的记录，依赖控制面对账兜底。
-- 不暴露公网入口。Service 是 ClusterIP，入口方式（Ingress / ALB / 内网直连）由部署方决定。
+For local development:
 
-## 请求链路
+- Go 1.26 or later, as specified in [go.mod](go.mod).
+- Git and `curl`.
+- Python 3.12 or later for the smoke test script. The usage display below also uses Python.
 
-1. 按路径识别协议：`/v1/chat/completions`、`/v1/responses`、`/v1/messages`。允许多一段前缀，如 `/openai/v1/chat/completions`。
-2. 从 `Authorization: Bearer <key>` 或 `x-api-key: <key>` 取客户 key，从请求体顶层取 `model` 和 `stream`。
-3. 调 `POST /admin/gateway/key-auth`。控制面不可达或超时直接返回 503（fail-closed），拒绝原因按客户端协议格式映射成 401 / 403 / 404 / 429。
-4. 在路由快照里查该模型：候选按 `priority` 分层（数值小的先试），同层内按 `weight` 加权随机排序，最多试 `max_failover_attempts` 个。
-5. 把 `model` 改成候选的 `providerModelCode`，只透传白名单里的请求头，注入供应商凭证，转发到 `<endpoint>/chat/completions|/responses|/messages`。
-6. 候选失败且还没给客户端写过任何字节时切下一个：连接失败、首包前超时、鉴权失败、HTTP 429、HTTP 5xx。所有候选都失败返回 502（超时 504）。
-7. 响应原样流回客户端，同时从 JSON 或 SSE 事件里解析 usage。
-8. 计量记录进内存队列，后台 worker 异步上报，失败指数退避重试。过了 key-auth 的请求都上报，上游失败也报（token 为零、`status_code` 照填）。
+For the Amazon Bedrock quick start:
 
-这八步里第 6 步是最常被问到的取舍。切换只能发生在首个响应字节之前，因为一旦开始向客户端写流，HTTP 状态码已经发出、
-客户端可能已经在渲染内容，此时换供应商重发会产生重复输出和重复计费，网关又无法撤回已发出的字节。所以流中的上游错误
-原样透传给客户端，由客户端决定是否重试。另一个容易踩的地方是第 3 步的 fail-closed：控制面不可用时所有请求都会 503，
-这是有意为之，代价是控制面成了转发路径上的强依赖，`key_auth_timeout` 要按控制面的 P99 延迟加余量设置。
+- An AWS account and credentials available through the [AWS SDK default credential chain](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-gosdk.html). Use temporary credentials, such as an IAM Identity Center session.
+- Access to a model that supports the Anthropic Messages API on your selected Amazon Bedrock Runtime endpoint, with permission to invoke it. Check the [Amazon Bedrock documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html) for model, API, and AWS Region availability.
+- The exact model or inference profile ID accepted by that endpoint. Use a supported cross-Region inference profile where appropriate; do not add `global.` unless the model and endpoint support it.
 
-## 快速开始（本地）
+You do not need an Amazon EKS cluster for local testing. AWS credentials are not required when using only non-AWS providers with environment-based API keys and no Secrets Manager references.
 
-前置：Go 1.26、能访问 Amazon Bedrock 的 AWS 凭证（本地可通过 `aws sso login` 或环境变量提供）。
+## Getting started
+
+This example runs the gateway and mock control plane locally, then sends a real inference request to Amazon Bedrock. Inference charges apply. The mock does not emulate a model or provide production authorization and billing.
+
+### 1. Clone and build
 
 ```bash
-go build -o bin/gateway ./cmd/gateway && go build -o bin/mock-controlplane ./cmd/mock-controlplane
-
-# 1. 起一个控制面替身：三个网关接口 + 调试接口，内置四个 Bedrock 模型的路由
-./bin/mock-controlplane -listen :9090 -token mock-token -keys sk-demo-key &
-
-# 2. 起网关，配置里的 ${CP_BASE_URL} / ${CP_GATEWAY_TOKEN} 从环境变量展开
-#    样例里 openai / anthropic 的 api_key 是 Secrets Manager 引用，本地没有这些 secret 时先注释掉这两个 provider
-CP_BASE_URL=http://127.0.0.1:9090 CP_GATEWAY_TOKEN=mock-token ./bin/gateway -config configs/gateway.example.yaml &
-
-# 3. 打一条
-curl -s http://localhost:8080/v1/messages -H 'Authorization: Bearer sk-demo-key' -H 'content-type: application/json' \
-  -d '{"model":"claude-sonnet-5","max_tokens":50,"messages":[{"role":"user","content":"hello"}]}'
-
-# 4. 看控制面收到的计量
-curl -s http://localhost:9090/debug/usages | python3 -m json.tool
-
-# 5. 全量冒烟：四个模型、三种协议、流式与非流式、负向用例、计量核对
-GW=http://localhost:8080 CP=http://localhost:9090 KEY=sk-demo-key scripts/smoke.sh
+git clone https://github.com/aws-samples/sample-llm-gateway.git
+cd sample-llm-gateway
+go build -o bin/gateway ./cmd/gateway
+go build -o bin/mock-controlplane ./cmd/mock-controlplane
 ```
 
-`configs/gateway.example.yaml` 里的 Bedrock provider 指向 ap-northeast-1，模型码用 `global.` 跨区域 inference profile，
-换区域改 `region` 和三个 `endpoints` 即可。Bedrock 上的 OpenAI 模型（GPT 系列）对调用方所在地有限制，从不受支持的
-地区发起会收到 400 `validation_error`，这时 Claude 正常、GPT 报错是环境问题不是网关问题。
+Run the remaining commands from the repository root. Keep the mock control plane and gateway running in separate terminals.
 
-不接 Bedrock、只想本地验证 OpenAI 兼容或 Anthropic 格式的第三方 API 时，不需要 AWS 凭证，用
-`configs/local-external.example.yaml` 加 `configs/routes.external.example.json`，步骤见
-[docs/operations.md](docs/operations.md) 的「本地验证外接 API 供应商」。
+### 2. Create a local configuration and route
 
-## 日常运维：改动落在哪一层
+Create `configs/gateway.local.yaml` with the following content. This filename is ignored by Git. The gateway binds only to the loopback interface and enables only the Bedrock provider, so no third-party API keys or Secrets Manager secrets are needed.
 
-**加模型只动控制面。**网关自己不认识任何模型名，全靠 `model-routes` 下发的
-`modelCode → providerCode + providerModelCode`。在控制面加一条路由，网关最多 `routes_poll_interval`（默认 30 秒）
-后生效，不用重启。Bedrock 上新增模型时，`providerModelCode` 填对应的 `global.` inference profile ID。
+```yaml
+server:
+  listen: "127.0.0.1:8080"
+control_plane:
+  base_url: "http://127.0.0.1:9090"
+  allow_insecure: true # Local mock only; use HTTPS for a real control plane.
+  token: "mock-token"
+providers:
+  bedrock:
+    auth: aws_iam
+    region: "${AWS_REGION}"
+    endpoints:
+      anthropic: "https://bedrock-runtime.${AWS_REGION}.amazonaws.com/anthropic/v1"
+```
 
-**接新供应商改网关配置并滚动重启一次。**在 `providers:` 下加一段：认证方式选 `bearer` /
-`x-api-key` / `aws_iam` / `none` 之一，填 `endpoints` 和凭证，然后控制面路由就可以引用这个 `providerCode`。
-凭证和 SigV4 签名器在启动时初始化，目前没有 provider 热加载，EKS 上改 ConfigMap 后 `kubectl rollout restart` 即可，
-两副本滚动无中断。
-
-**需要改代码的只有两种情况**：上游要一种现有四种之外的认证方式（如 HMAC 签名、URL 查询参数带
-`api-version`）；或者上游的协议形态不是 OpenAI Chat / Responses / Anthropic Messages 三种之一，或 usage 字段不按
-这三家的格式返回。详细步骤见 [docs/operations.md](docs/operations.md)。
-
-## 网关改了什么
-
-| 方向 | 改动 | 原因 |
-| --- | --- | --- |
-| 请求体 | `model` 替换为路由里的 `providerModelCode`，原样不加工 | 客户端看到的模型名与供应商侧模型码解耦，同一名字可以路由到不同供应商 |
-| 请求体（OpenAI chat 且 `stream: true`） | 合并进 `stream_options.include_usage: true` | OpenAI 兼容端点在流式响应中默认不返回 usage |
-| 请求头 | 只透传 `Accept`、`anthropic-version`、`anthropic-beta`、`openai-beta`；客户端鉴权头一律剥掉，`User-Agent` 换成网关自己的 | 客户 key 不能泄露给供应商，供应商凭证也不能被客户端指定 |
-| 请求头（Anthropic） | 缺 `anthropic-version` 时补 `2023-06-01` | Bedrock 的 Anthropic 接口要求该头必填 |
-| 响应头 | 透传 `Content-Type`、`Cache-Control`；新增 `X-Request-Id`（网关生成，也是计量的 `request_id`）和 `X-Upstream-Request-Id`（上游的 `x-request-id` / `request-id` / `x-amzn-requestid`） | 客户端拿 `X-Request-Id` 能在网关日志和控制面计量里找到同一条记录 |
-
-请求体的嵌套内容按原始字节携带，不重新编码，所以 `messages`、`tools`、`input` 等字段里的任何内容都不会被改写或丢字段。
-
-## 部署概览
-
-镜像用 [ko](https://ko.build) 构建（无需 Docker daemon，也提供了 `deploy/Dockerfile`，两个基础镜像都按 digest 钉死），基础镜像是 Amazon ECR Public 的
-`amazonlinux:2023-minimal`，无 shell，非 root 运行。Dockerfile 里的 `HEALTHCHECK` 用网关自带的 `-healthcheck` 参数探 `/healthz`（镜像没有 curl），
-Kubernetes 不读这条，用清单里的 readiness / liveness probe。清单里的镜像写成 `tag@digest`，digest 取 ko 输出，发新版两处一起改。EKS 上用 IRSA 给 Pod 授权调 Bedrock，不需要任何静态 AWS 密钥。
-网关自己的密钥（控制面 token、第三方供应商 api_key）支持两种存法：明文（`${ENV}` 从 K8s Secret 注入）或
-AWS Secrets Manager（配置里写 `secretsmanager://<secret>#<键>`，启动时经 IRSA 读取，Pod 不注入任何密钥环境变量）。
-PoC 环境采用后者。
+Create a local working directory:
 
 ```bash
-export KO_DOCKER_REPO=<account>.dkr.ecr.<region>.amazonaws.com/sample-llm-gateway
-ko build --base-import-paths --platform=linux/amd64,linux/arm64 --tags=v0.6.1 ./cmd/gateway ./cmd/mock-controlplane
-
-eksctl create cluster -f deploy/eks/cluster.yaml
-aws iam create-policy --policy-name llm-gateway-poc-bedrock-invoke --policy-document file://deploy/eks/bedrock-invoke-policy.json
-aws iam create-policy --policy-name llm-gateway-poc-secrets-read --policy-document file://deploy/eks/secrets-read-policy.json
-eksctl create iamserviceaccount --cluster llm-gateway-poc --region ap-northeast-1 \
-  --namespace llm-gateway --name llm-gateway --role-name llm-gateway-poc-bedrock-invoke \
-  --attach-policy-arn arn:aws:iam::<account>:policy/llm-gateway-poc-bedrock-invoke \
-  --attach-policy-arn arn:aws:iam::<account>:policy/llm-gateway-poc-secrets-read --approve
-# 网关的密钥进 Secrets Manager（JSON，配置里按键引用）
-aws secretsmanager create-secret --region ap-northeast-1 --name llm-gateway/poc --secret-string '{"CP_GATEWAY_TOKEN":"<token>"}'
-# 这个 K8s Secret 只给 mock 控制面用（它要校验同一个 token 并持有测试 key），正式环境不需要
-kubectl create secret generic llm-gateway-secrets -n llm-gateway \
-  --from-literal=CP_GATEWAY_TOKEN=<token> --from-literal=MOCK_API_KEYS=sk-demo-key
-kubectl apply -f deploy/k8s/
+mkdir -p .local
 ```
 
-`deploy/k8s/` 的文件按序号应用：命名空间、ServiceAccount、私网节点池与 NetworkPolicy（`05-network.yaml`，可选）、
-mock 控制面（正式环境删掉，把 ConfigMap 里的 `control_plane.base_url` 指向真实控制面）、网关。IAM 策略只给
-`bedrock:InvokeModel` / `InvokeModelWithResponseStream`，资源限定 foundation model、inference profile 和 Responses API
-鉴权用的 `project/default`；跨账号场景再加一条 `sts:AssumeRole`；密钥走 Secrets Manager 时另加一条限定 `llm-gateway/*`
-前缀的 `secretsmanager:GetSecretValue`。
+Save the following as `.local/routes.json`, which is also ignored by Git. Replace `YOUR_MESSAGES_MODEL_OR_INFERENCE_PROFILE_ID` with the exact ID for your chosen Messages-compatible model. `demo-model` is a client-facing alias, not an Amazon Bedrock model ID.
 
-网关 Deployment 两副本，带节点反亲和（两副本必须在不同节点，硬约束）、跨可用区分布（软约束）和
-PodDisruptionBudget（`minAvailable: 1`），节点维护或 Auto Mode 整合节点时始终有一个副本在服务。
-
-完整的 IRSA、私有子网、VPC Endpoint、跨账号步骤见 [docs/private-networking.md](docs/private-networking.md)。
-
-## 可观测性一览
-
-- `GET /healthz` 存活；`GET /readyz` 路由快照加载完成后才就绪。
-- `GET /metrics` Prometheus 文本格式，指标全部以 `llmgw_` 开头。
-- stdout 一行一条 JSON 日志，每个请求一条 `request completed`，带 `request_id`、subject、provider、状态码、时延、token 数。
-- `GET /v1/models` 按 OpenAI list 格式返回当前路由快照里的模型（不鉴权）。
-
-指标表、日志字段、排障手册见 [docs/operations.md](docs/operations.md)。
-
-## 测试与 CI
-
-- `go test ./...`：协议解析（三种协议的 usage 提取、流式解析）、路由（优先级分层、权重）、转发主流程
-  （用 httptest 伪造控制面和上游：改写、流式 usage、`include_usage` 注入、5xx 切换、拒绝格式、负向路径）。
-- `scripts/smoke.sh`：端到端冒烟，需要真实 Bedrock。默认测 Claude Sonnet 5 / Opus 5 的 messages、GPT-5.6 Sol / Luna
-  的 chat 与 responses，各跑流式与非流式，再跑负向用例，最后核对控制面是否为每次成功调用收到了 token。
-  被测模型列表可用 `CLAUDE_MODELS` / `GPT_MODELS` 环境变量覆盖。
-- `loadtest/`：k6 压测脚本与 Job，集群内直接打网关 Service。用法与 2026-09-03 的 PoC 结果（3M TPM、约 100 在途连接）
-  见 [loadtest/README.md](loadtest/README.md)。
-- CI：`.github/workflows/ci.yml`（GitHub Actions）与 `.gitlab-ci.yml` 同一套检查，都跑 `go vet`、`go test -race`、`govulncheck`、构建；
-  GitLab 侧另加自带的 SAST（semgrep）与 Secret Detection。semgrep 误报用行内 `nosemgrep` 注释压（k6 脚本的 Math.random 非安全用途、
-  网关按配置地址发请求的 G107）。改协议层必跑单测，改转发主流程必跑冒烟，单测过不等于链路通。
-- 部署清单里的账号号（`123456789012` / `111122223333`）、VPC / 子网 / 安全组 ID、VPC Endpoint 域名、出口 IP 都是占位，
-  按 [docs/private-networking.md](docs/private-networking.md) 换成自己环境的值。
-
-## 已知限制（第一阶段）
-
-- 不做协议转换。客户端给 Bedrock 上的 GPT 模型发 `max_tokens` 会收到模型自己的 400（它要的是 `max_completion_tokens`）。
-- 计量在内存队列里。进程崩溃会丢掉尚未发出的记录，依赖控制面的对账任务兜底。
-- 故障转移只发生在首个响应字节之前。流一旦开始，错误原样透传。
-- 流被 `request_timeout` 截断时，网关不会往流里插入自己的错误事件（不做协议转换），客户端收到的是一次正常结束的连接。
-  接入方要靠协议自身的结束标记判断完整性：Anthropic 看 `message_stop`，OpenAI chat 看 `[DONE]`，Responses 看 `response.completed`。
-- 没跑完的流不计费：客户端中途断开上报 499，被 `request_timeout` 切断上报 504，上游连接中途断掉上报 502，token 全 0；
-  供应商按实际已生成的 token 收费，这部分差额由运营方承担（客户确认的口径）。
-- provider 配置改动和密钥轮转都需要滚动重启（密钥只在启动时读一次），路由改动不需要。
-- 路由里引用了配置中不存在的 provider，或该 provider 不支持进入的协议时，这个候选会被跳过；若所有候选都因此不可用，
-  客户端收到 502 而不是 400，日志里有 `route references unconfigured provider` / `provider lacks endpoint for protocol`。
-- Bedrock 上的 OpenAI 模型有调用方所在地限制，网关必须部署在受支持的区域。
-
-## 目录结构
-
+```json
+{
+  "models": [
+    {
+      "modelCode": "demo-model",
+      "providers": [
+        {
+          "providerCode": "bedrock",
+          "providerModelCode": "YOUR_MESSAGES_MODEL_OR_INFERENCE_PROFILE_ID",
+          "priority": 10,
+          "weight": 100
+        }
+      ]
+    }
+  ]
+}
 ```
-cmd/gateway/              网关入口：加载配置、初始化 provider、拉路由、起 HTTP 服务、优雅退出
-cmd/mock-controlplane/    控制面替身：三个网关接口 + /debug/usages + /debug/routes，本地与集群冒烟用
-internal/config/          YAML 配置结构、${ENV} 展开、默认值、校验
-internal/controlplane/    控制面 HTTP 客户端：model-routes（ETag）、key-auth、usage/report（ApiResult 解包）
-internal/router/          路由快照（原子替换）、候选排序、后台轮询
-internal/provider/        供应商注册表；bearer / x-api-key / none / aws_iam（SigV4，支持 AssumeRole）
-internal/secrets/         密钥解析：secretsmanager:// 引用 → AWS Secrets Manager（启动时一次，按 secret 缓存）
-internal/protocol/        协议识别、请求体改写、三种协议的 usage 解析、SSE 流解析、错误格式
-internal/proxy/           转发主流程：鉴权闸门、路由、故障转移、流式 tee、计量上报、/v1/models
-internal/metering/        计量队列：有界 channel、worker、指数退避、满队列丢弃计数
-internal/observability/   JSON 日志、Prometheus 指标
-configs/                  gateway.example.yaml（全字段注释样例）
-deploy/eks/               eksctl 集群规格、Bedrock 调用与 Secrets Manager 读取的 IAM 策略
-deploy/k8s/               命名空间、ServiceAccount（IRSA）、私网节点池与 NetworkPolicy、mock 控制面、网关
-scripts/smoke.sh          端到端冒烟
-loadtest/                 k6 压测脚本、Job 与 PoC 结果
+
+### 3. Start the mock control plane
+
+In the first terminal:
+
+```bash
+./bin/mock-controlplane \
+  -listen 127.0.0.1:9090 \
+  -token mock-token \
+  -keys sk-demo-key \
+  -routes .local/routes.json
 ```
+
+These are public test credentials. Do not reuse them outside this local example. The mock's `/debug/*` endpoints are unauthenticated.
+
+### 4. Start the gateway
+
+In the second terminal, configure your AWS credentials and select a Region that supports your chosen model and API. The following uses `ap-northeast-1` as an example; change it if needed.
+
+```bash
+export AWS_REGION=ap-northeast-1
+./bin/gateway -config configs/gateway.local.yaml
+```
+
+The gateway loads the initial route snapshot before accepting requests. A successful startup includes a `gateway listening` log entry.
+
+### 5. Send a request and check usage
+
+In a third terminal:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8080/readyz
+curl --fail-with-body -sS http://127.0.0.1:8080/v1/models
+
+curl --fail-with-body -sS http://127.0.0.1:8080/v1/messages \
+  -H 'Authorization: Bearer sk-demo-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"demo-model","max_tokens":64,"messages":[{"role":"user","content":"Say hello in one sentence."}]}'
+
+curl --fail-with-body -sS http://127.0.0.1:9090/debug/usages | python3 -m json.tool
+```
+
+Expect `ready` from `/readyz`, the `demo-model` alias in `/v1/models`, and a Messages response from inference. Usage reporting is asynchronous; repeat the final command if the record has not arrived. A successful inference report should include `status_code: 200` and token counts. Readiness and model listing alone do not verify model access.
+
+For streaming, add `"stream": true` to the request body and use `curl -N`. For another protocol, add its endpoint to the provider configuration and use a model that supports it.
+
+For non-AWS providers, see [configs/local-external.example.yaml](configs/local-external.example.yaml), [configs/routes.external.example.json](configs/routes.external.example.json), and the walkthrough in [docs/operations.md](docs/operations.md). The full [gateway configuration example](configs/gateway.example.yaml) includes optional providers and Secrets Manager references; remove unused providers before using it locally.
+
+## Control plane integration
+
+Implement these endpoints in your control plane. Requests include a shared token in `X-HIGRESS-Token` by default; the header name is configurable.
+
+| Endpoint | Responsibility |
+| --- | --- |
+| `GET /admin/gateway/model-routes` | Return model aliases and provider candidates. Support ETags for route polling. |
+| `POST /admin/gateway/key-auth` | Validate the client key, model access, rate limits, and available quota in one call. |
+| `POST /admin/gateway/usage/report` | Accept normalized usage records and deduplicate retries by `request_id`. |
+
+For each inference request, the gateway extracts the key from `Authorization: Bearer <key>` or `x-api-key`, calls `key-auth`, selects a route, and forwards the request. An unavailable or timed-out authorization service results in HTTP 503. Rejections map to HTTP 401, 403, 404, or 429 in the incoming protocol's error format.
+
+Route polling defaults to 30 seconds. Add models by updating control-plane routes; no gateway restart is needed. Adding a provider, changing its configuration, or rotating a configured secret requires a gateway restart. Keep route `providerCode` values aligned with the configured providers.
+
+See [docs/control-plane.md](docs/control-plane.md) for the complete contract, response envelopes, rejection mappings, and token accounting definitions.
+
+## Request and response handling
+
+Protocol preservation does not mean byte-for-byte forwarding of the entire HTTP request. The gateway makes these changes:
+
+| Area | Behavior |
+| --- | --- |
+| Request model | Replace `model` with `providerModelCode`, without adding prefixes or modifying the ID. |
+| Streaming Chat Completions | Set `stream_options.include_usage` to `true`, retaining other stream options. |
+| Request headers | Forward only `Accept`, `anthropic-version`, `anthropic-beta`, and `openai-beta` from the client. Set the JSON content type and gateway user agent, and apply provider credentials. |
+| Anthropic version | Supply `anthropic-version: 2023-06-01` if absent. |
+| Response headers | Forward `Content-Type` and `Cache-Control`; add `X-Request-Id` and, when available, `X-Upstream-Request-Id`. Set `Content-Length` for buffered responses and `X-Accel-Buffering: no` for SSE. |
+
+Other request fields are retained without protocol conversion, although JSON serialization can change whitespace and field ordering. Response bodies are relayed without format conversion, subject to size and error handling limits. Clients must supply parameters supported by the model; the gateway does not rename fields such as `max_tokens` to `max_completion_tokens`.
+
+Before committing to a response, the gateway can try another candidate on local credential/signing errors, transport errors, or HTTP 429/5xx responses. Attempts are bounded by `max_failover_attempts` (default: 3) and the overall request timeout. Other upstream HTTP errors, including 401 and 403, are passed through. The last candidate's HTTP 429/5xx response can also be passed through; failures without a committed upstream response generally produce HTTP 502 or 504. There is no failover after response relay begins.
+
+## Deployment on Amazon EKS
+
+The repository includes an `eksctl` configuration and Kubernetes manifests, not a one-command deployment. The sample uses an existing VPC, EKS Auto Mode, private-subnet nodes, IAM roles for service accounts (IRSA), and a `ClusterIP` Service.
+
+Before applying the manifests:
+
+1. Install and configure the AWS CLI, `eksctl`, `kubectl`, and [ko](https://ko.build). Confirm the target account and Region. Adapt [deploy/eks/cluster.yaml](deploy/eks/cluster.yaml), including the Kubernetes version, VPC, subnets, and restricted API-server access CIDR.
+2. Scope the [Bedrock policy](deploy/eks/bedrock-invoke-policy.json) to your models and inference profiles. Configure IRSA and update [the service account](deploy/k8s/10-serviceaccount.yaml). If using Secrets Manager, create the referenced secrets and scope the [secrets-read policy](deploy/eks/secrets-read-policy.json). Remove cross-account configuration unless needed.
+3. Build and publish images to your Amazon Elastic Container Registry (Amazon ECR) repositories. Replace the account, Region, and tag below. Update both the image tag and digest in the deployment manifests with your build output.
+4. Review [deploy/k8s/05-network.yaml](deploy/k8s/05-network.yaml) separately: it includes cluster-scoped node resources and a `kube-system` configuration change. Both deployments select nodes labeled `network-tier: private`; provide those nodes or adapt the selectors. The private-only egress policy does not allow public third-party API endpoints.
+5. Create the namespace, configure the service account and secrets, and apply the reviewed workload manifests. The mock requires a `llm-gateway-secrets` Kubernetes Secret with `CP_GATEWAY_TOKEN` and `MOCK_API_KEYS`. For a real control plane, omit the mock and configure the gateway to use your HTTPS service.
+6. Verify rollout status, readiness, a real inference request, and its usage report. Configure TLS and access controls at your chosen ingress if clients need access outside the cluster.
+
+Example image build, after preparing ECR access:
+
+```bash
+export KO_DOCKER_REPO="123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/sample-llm-gateway"
+ko build --base-import-paths --platform=linux/amd64,linux/arm64 \
+  --tags=v0.6.1 ./cmd/gateway ./cmd/mock-controlplane
+```
+
+`ko` does not require a Docker daemon. A [Dockerfile](deploy/Dockerfile) is also available for the gateway. The gateway manifests use two replicas, required node anti-affinity, health probes, a PodDisruptionBudget, non-root containers, and read-only root filesystems. These settings support availability and isolation but do not guarantee uninterrupted service.
+
+Account IDs, infrastructure IDs, endpoint hostnames, and image references in deployment examples must be reviewed and replaced. See [docs/private-networking.md](docs/private-networking.md) for the detailed deployment and private connectivity walkthrough.
+
+## Observability
+
+| Endpoint or output | Purpose |
+| --- | --- |
+| `GET /healthz` | Liveness check. |
+| `GET /readyz` | Readiness after initial route loading; returns 503 while draining. Not an upstream availability check. |
+| `GET /metrics` | Prometheus metrics prefixed with `llmgw_`. |
+| `GET /v1/models` | OpenAI-format listing of the current route snapshot. Not filtered by client permissions. |
+| Standard output | JSON logs with request IDs, provider, status, latency, and usage fields. |
+
+Use `X-Request-Id` to correlate inference requests with logs and usage reports. Health, metrics, and model listing endpoints are unauthenticated; restrict access at the network or ingress layer. See [docs/operations.md](docs/operations.md) for metric definitions and troubleshooting.
+
+## Testing
+
+Run local checks without AWS credentials or live model calls:
+
+```bash
+go vet ./...
+go test -race ./... -count=1
+```
+
+The race detector requires a supported platform and a C toolchain. Tests cover protocol parsing, routing, request rewriting, streaming usage, authorization failures, failover, queue behavior, and shutdown scenarios with mock HTTP services.
+
+For a live smoke test against the local quick start:
+
+```bash
+GW=http://127.0.0.1:8080 CP=http://127.0.0.1:9090 KEY=sk-demo-key \
+  CLAUDE_MODELS="demo-model" GPT_MODELS="" RESPONSES_MODELS="" \
+  bash scripts/smoke.sh
+```
+
+The script sends real inference requests, tests streaming and non-streaming behavior and negative cases, and checks received usage records. It clears the mock's previous usage records before running. Use only a test control plane and test keys. For other routes, set the three model variables to the appropriate space-separated aliases; an empty value skips that protocol group. Live tests incur provider charges.
+
+[GitHub Actions](.github/workflows/ci.yml) runs `go vet`, race-enabled tests, `govulncheck`, and binary builds. These checks do not validate deployed AWS permissions, networking, or model availability. Load-test scripts and environment-specific results are in [loadtest/README.md](loadtest/README.md); those results are not performance guarantees.
+
+## Security considerations
+
+- **Protect network traffic.** The gateway serves HTTP and does not terminate TLS. Use a secured TLS ingress or proxy for remote clients. Use HTTPS for a real control plane: authorization and usage requests carry client keys and the shared token. `allow_insecure: true` is a test-only exception.
+- **Keep the mock private.** Its fixed credentials and unauthenticated debug endpoints are for testing, not production access control.
+- **Use least-privilege AWS access.** Prefer temporary credentials and review permissions for the model, inference profile, API, and any cross-account role. Retrieve and compare live IAM policies before changing them; do not overwrite them blindly with sample files.
+- **Keep secrets out of source control.** Use environment variables or `secretsmanager://<secret-id>[#<json-key>]` references. Configured secrets are resolved at startup; restart after rotation. Restrict access to provider configuration and route administration.
+- **Review data handling.** Prompts and responses pass through to the selected provider. Logs can contain subject identifiers and upstream error snippets; usage reports contain client API keys. Restrict access, define retention, and assess provider terms and data residency requirements before handling sensitive data.
+
+## Known limitations
+
+- Only the three inference APIs listed above are implemented. This is not a full OpenAI or Anthropic API replacement, and it does not translate to Converse or other protocols.
+- Authorization is a synchronous control-plane dependency. If `key-auth` is unavailable, inference requests fail closed with HTTP 503.
+- Usage reporting is not a durable billing ledger. Records can be lost on a crash, queue overflow, exhausted retries, or an unsuccessful shutdown flush. Reconcile independently with provider usage.
+- After response relay begins, the gateway does not retry or inject its own SSE error events. Clients should check completion markers such as `message_stop`, `[DONE]`, or `response.completed` to detect incomplete streams.
+- Detected interrupted transfers report zero tokens, with status 499 for client disconnects, 504 for request timeouts, or 502 for upstream transfer errors. These are metering statuses when response headers have already been sent. Providers may still charge for tokens generated before interruption.
+- Provider configuration and configured secret changes require a restart; route updates do not. Unconfigured providers or providers missing the required protocol endpoint are skipped and can result in HTTP 502 if no candidate is usable.
+- Request bodies are buffered, with a default 32 MiB limit. Non-streaming upstream responses are buffered up to 64 MiB; larger responses are rejected with HTTP 502. Size capacity for concurrent large requests accordingly.
+- Model availability, API support, quotas, and geographic eligibility depend on the provider and endpoint. The gateway does not remove these restrictions.
+
+## Costs
+
+You are responsible for charges incurred while using this sample. Local execution creates no AWS infrastructure, but real inference requests are billed by Amazon Bedrock or your chosen provider.
+
+An EKS deployment can also incur charges for the cluster, EKS Auto Mode and compute, Amazon EBS storage, ECR storage, Secrets Manager, VPC endpoints, NAT gateways, data transfer, and any load balancers or logging services you add. Idle infrastructure can continue to incur charges.
+
+Estimate your configuration with the [AWS Pricing Calculator](https://calculator.aws/) and check current [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) and [Amazon EKS pricing](https://aws.amazon.com/eks/pricing/).
+
+## Clean up
+
+For the local quick start, stop the gateway with `Ctrl+C`, allow it to finish shutting down, and then stop the mock control plane. These steps create no AWS infrastructure. Remove local binaries, configuration, and the route file if no longer needed.
+
+For an EKS deployment, verify the AWS account, Kubernetes context, and resource ownership before removing anything:
+
+1. Stop test clients and load-test Jobs. Remove sample-specific ingress or load balancer resources while their controllers are still running.
+2. Remove the sample workloads, Services, ConfigMaps, Secrets, service account, and network policies in `llm-gateway`. Delete the namespace only if dedicated to this sample.
+3. Delete a sample-only cluster through `eksctl`. On a shared cluster, remove only sample-owned node resources after confirming no other workloads depend on them.
+4. Remove sample-only IAM roles and policies, ECR images or repositories, and Secrets Manager secrets. Use the Secrets Manager recovery window when scheduling deletion.
+5. Review remaining storage, log groups, endpoints, and networking for ongoing charges. Remove only resources created exclusively for this sample.
+
+Do not run a blanket `kubectl delete -f deploy/k8s/` on a shared cluster: `05-network.yaml` also targets `kube-system` configuration and cluster-scoped resources. Do not delete a reused VPC, shared subnets, NAT gateways, VPC endpoints, or peering connections. Restore shared configuration from its recorded pre-deployment state where necessary.
+
+## Documentation
+
+This README is in English. Detailed guides, the load-test README, changelog, and many configuration comments are currently in Chinese.
+
+| Document | Contents |
+| --- | --- |
+| [Configuration](docs/configuration.md) | Fields, defaults, environment expansion, and secret references. |
+| [Control plane contract](docs/control-plane.md) | Routes, authorization, usage reporting, and error mappings. |
+| [Operations](docs/operations.md) | Adding models and providers, upgrades, metrics, and troubleshooting. |
+| [Private networking](docs/private-networking.md) | EKS, IRSA, VPC endpoints, cross-Region, and cross-account setup. |
+| [Robustness report](docs/robustness-report.md) | Fault-injection scenarios and test results. |
+| [Load testing](loadtest/README.md) | k6 scripts, Kubernetes Jobs, and test-environment measurements. |
+| [Changelog](CHANGELOG.md) | Version history and upgrade notes. |
+
+### Repository structure
+
+```text
+cmd/gateway/            Gateway entry point and lifecycle
+cmd/mock-controlplane/  Test control plane and debug endpoints
+internal/config/        Configuration loading and validation
+internal/controlplane/  Control plane HTTP client
+internal/router/        Route snapshots, polling, and candidate selection
+internal/provider/      Provider registry and authentication
+internal/secrets/       AWS Secrets Manager resolution
+internal/protocol/      Request handling, errors, and usage parsing
+internal/proxy/         Inference forwarding, failover, and response relay
+internal/metering/      In-memory usage queue and retries
+internal/observability/ JSON logging and Prometheus metrics
+configs/                Example gateway configurations and routes
+deploy/                 Container, EKS, IAM, and Kubernetes examples
+docs/                   Detailed guides
+scripts/                Live smoke test
+loadtest/               k6 scripts, Jobs, and results
+```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for bug reports, feature requests, and pull request guidelines. This project follows the [Amazon Open Source Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
-安全问题不要提 issue，按 [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) 里的方式报告。
+If you discover a potential security issue, follow the [security issue notification process](CONTRIBUTING.md#security-issue-notifications). Do not report security vulnerabilities in public GitHub issues.
 
 ## License
 
-本项目使用 MIT-0 License，见 [LICENSE](LICENSE)。
+This sample is licensed under the MIT-0 License. See [LICENSE](LICENSE).
 
----
+### AWS sample code notice
 
-以下为 AWS 样例代码声明，按原文保留。
-
-```
+```text
 ###################
 This sample code is provided to you as AWS Content under the AWS Customer Agreement,
 or the relevant written agreement between you and AWS (whichever applies). You should
