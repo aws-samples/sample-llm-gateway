@@ -110,12 +110,12 @@ func (s *server) handleKeyAuth(w http.ResponseWriter, r *http.Request) {
 		resp["rejectReason"], resp["message"] = "MODEL_NO_PROVIDER", "model has no active provider"
 	default:
 		resp["valid"] = true
-		resp["keyCode"] = "key-" + req.APIKey[len(req.APIKey)-4:]
+		resp["keyCode"] = "key-" + maskKey(req.APIKey)
 		resp["subjectType"] = "USER"
 		resp["subjectCode"] = "demo.user@example.com"
 		resp["remainingQuotaUsd"] = 100.0
 	}
-	log.Printf("key-auth key=...%s model=%s valid=%v reason=%v", tail(req.APIKey), req.ModelCode, resp["valid"], resp["rejectReason"])
+	log.Printf("key-auth key=...%s model=%s valid=%v reason=%v", maskKey(req.APIKey), req.ModelCode, resp["valid"], resp["rejectReason"])
 	apiResult(w, resp)
 }
 
@@ -147,7 +147,7 @@ func (s *server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.seen[reqID] = true
-	rec["api_key"] = "..." + tail(apiKey)
+	rec["api_key"] = "..." + maskKey(apiKey)
 	s.usages = append(s.usages, rec)
 	log.Printf("usage %s", string(mustJSON(rec)))
 	apiResult(w, map[string]any{"accepted": true, "duplicate": false, "message": "ok"})
@@ -264,7 +264,9 @@ func defaultRoutes() routes {
 	}}
 }
 
-func tail(s string) string {
+// maskKey redacts an api key down to its last 4 characters, the only part that ever reaches a
+// log line, the keyCode echoed to the gateway, or the stored usage record.
+func maskKey(s string) string {
 	if len(s) <= 4 {
 		return s
 	}

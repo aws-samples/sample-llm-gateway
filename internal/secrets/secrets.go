@@ -16,6 +16,7 @@ package secrets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -50,10 +51,10 @@ func ParseRef(v string) (Ref, error) {
 	rest := strings.TrimPrefix(v, Scheme)
 	id, key, _ := strings.Cut(rest, "#")
 	if id == "" {
-		return Ref{}, fmt.Errorf("%q: empty secret id", v)
+		return Ref{}, errors.New("empty secret id")
 	}
 	if strings.Contains(rest, "#") && key == "" {
-		return Ref{}, fmt.Errorf("%q: empty json key after '#'", v)
+		return Ref{}, errors.New("empty json key after '#'")
 	}
 	return Ref{SecretID: id, JSONKey: key}, nil
 }
