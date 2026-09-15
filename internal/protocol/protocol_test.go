@@ -88,6 +88,45 @@ func TestOpenAIChatUsageNormalization(t *testing.T) {
 	}
 }
 
+// N1: negative counters from a misbehaving upstream (some emit -1 for "unknown") must be
+// clamped to 0 at the package boundary — the handler feeds these into Prometheus Counters,
+// which panic on negative Add. Found stays true so the record is still reported.
+func TestNegativeUsageClampedAllProtocols(t *testing.T) {
+	cases := []struct {
+		name  string
+		proto Protocol
+		body  string
+	}{
+		{"openai chat", OpenAIChat, `{"usage":{"prompt_tokens":-1,"completion_tokens":-1,"prompt_tokens_details":{"cached_tokens":-3},"completion_tokens_details":{"reasoning_tokens":-2}}}`},
+		{"openai responses", OpenAIResponses, `{"usage":{"input_tokens":-1,"output_tokens":-4,"input_tokens_details":{"cached_tokens":-1},"output_tokens_details":{"reasoning_tokens":-9}}}`},
+		{"anthropic", Anthropic, `{"usage":{"input_tokens":-1,"output_tokens":-1,"cache_read_input_tokens":-7,"cache_creation_input_tokens":-2}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := ParseUsage(tc.proto, []byte(tc.body))
+			if !u.Found {
+				t.Fatal("Found should be true: negative values are still a usage object")
+			}
+			if u.Input < 0 || u.Output < 0 || u.CacheRead < 0 || u.CacheWrite < 0 || u.Reasoning < 0 {
+				t.Errorf("negative field leaked: %+v", u)
+			}
+		})
+	}
+
+	// Streaming parsers go through the same boundary.
+	s := NewStreamParser(Anthropic)
+	s.Feed("message_start", []byte(`{"type":"message_start","message":{"usage":{"input_tokens":-1,"output_tokens":-1}}}`))
+	s.Feed("message_delta", []byte(`{"type":"message_delta","usage":{"output_tokens":-3}}`))
+	if u := s.Usage(); !u.Found || u.Input < 0 || u.Output < 0 {
+		t.Errorf("anthropic stream negative leaked: %+v", u)
+	}
+	c := NewStreamParser(OpenAIChat)
+	c.Feed("", []byte(`{"choices":[],"usage":{"prompt_tokens":-1,"completion_tokens":-1}}`))
+	if u := c.Usage(); !u.Found || u.Input < 0 || u.Output < 0 {
+		t.Errorf("openai chat stream negative leaked: %+v", u)
+	}
+}
+
 func TestOpenAIChatStream(t *testing.T) {
 	s := NewStreamParser(OpenAIChat)
 	s.Feed("", []byte(`{"id":"x","choices":[{"delta":{"content":"hi"}}],"usage":null}`))

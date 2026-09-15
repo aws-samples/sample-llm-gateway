@@ -37,6 +37,18 @@ type sigV4Auth struct {
 
 const bedrockServiceName = "bedrock"
 
+// credentialsCacheOptions makes cached credentials count as expired a few minutes before
+// their real expiry, so a refresh happens ahead of time instead of a request being signed
+// milliseconds before expiry and arriving at Bedrock already expired (403 ExpiredTokenException,
+// which the handler does not fail over). The SDK default window is 0. SDK clients hide this
+// with an "invalidate-and-retry" middleware; this gateway signs raw HTTP requests and has none.
+// Applied to both the base chain (IRSA/env/profile) and the AssumeRole chain. Jitter spreads
+// refreshes across replicas so they don't all hit STS at the same instant.
+func credentialsCacheOptions(o *aws.CredentialsCacheOptions) {
+	o.ExpiryWindow = 5 * time.Minute
+	o.ExpiryWindowJitterFrac = 0.1
+}
+
 func newSigV4(ctx context.Context, code string, pc config.ProviderConfig) (*sigV4Auth, error) {
 	stsRegion := pc.STSRegion
 	if stsRegion == "" {
@@ -48,7 +60,10 @@ func newSigV4(ctx context.Context, code string, pc config.ProviderConfig) (*sigV
 	if stsRegion == "" {
 		stsRegion = pc.Region
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(stsRegion))
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(stsRegion),
+		awsconfig.WithCredentialsCacheOptions(credentialsCacheOptions),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
@@ -61,7 +76,7 @@ func newSigV4(ctx context.Context, code string, pc config.ProviderConfig) (*sigV
 				o.ExternalID = aws.String(pc.ExternalID)
 			}
 		})
-		creds = aws.NewCredentialsCache(p)
+		creds = aws.NewCredentialsCache(p, credentialsCacheOptions)
 	}
 
 	// Fail fast at startup if no credentials can be resolved, and log who we are so

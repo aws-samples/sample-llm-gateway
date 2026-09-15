@@ -75,8 +75,9 @@ type fakeUpstream struct {
 	mu       sync.Mutex
 	lastBody map[string]any
 	lastHdr  http.Header
-	fail     int // status to return instead of success, 0 = ok
-	bigBody  int // when >0, non-stream /messages returns a 200 body of this many bytes
+	fail     int  // status to return instead of success, 0 = ok
+	bigBody  int  // when >0, non-stream /messages returns a 200 body of this many bytes
+	negUsage bool // when true, non-stream /messages returns negative token counts (some servers emit -1 for "unknown")
 }
 
 func (u *fakeUpstream) handler() http.Handler {
@@ -88,6 +89,7 @@ func (u *fakeUpstream) handler() http.Handler {
 		u.lastBody, u.lastHdr = m, r.Header.Clone()
 		fail := u.fail
 		big := u.bigBody
+		neg := u.negUsage
 		u.mu.Unlock()
 		if fail != 0 {
 			w.WriteHeader(fail)
@@ -100,6 +102,10 @@ func (u *fakeUpstream) handler() http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			if big > 0 {
 				_, _ = w.Write(bytes.Repeat([]byte("x"), big))
+				return
+			}
+			if neg {
+				_, _ = fmt.Fprint(w, `{"id":"msg_1","type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":-1,"output_tokens":-1,"cache_read_input_tokens":-5,"cache_creation_input_tokens":-2}}`)
 				return
 			}
 			_, _ = fmt.Fprint(w, `{"id":"msg_1","type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}`)
@@ -303,6 +309,29 @@ func TestFailoverOn5xxBeforeFirstByte(t *testing.T) {
 	reps := h.cp.waitReports(1)
 	if len(reps) != 1 || reps[0].ProviderModelCode != "backup-claude-x" {
 		t.Errorf("report should name the provider that served: %+v", reps)
+	}
+}
+
+// N1 regression: an upstream that reports negative token counts must not panic the handler
+// (prometheus Counter.Add panics on v<0, which would fire after the response is written and
+// drop the metering record). Expect 200, exactly one report, and counters clamped to zero.
+func TestNegativeUsageDoesNotPanicAndStillReports(t *testing.T) {
+	h := newHarness(t)
+	h.up.mu.Lock()
+	h.up.negUsage = true
+	h.up.mu.Unlock()
+
+	resp, body := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"claude-x","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d body %s", resp.StatusCode, body)
+	}
+	reps := h.cp.waitReports(1)
+	if len(reps) != 1 {
+		t.Fatalf("want exactly 1 usage report (handler must not panic before report), got %d", len(reps))
+	}
+	r := reps[0]
+	if r.StatusCode != 200 || r.InputTokens != 0 || r.OutputTokens != 0 || r.CacheReadTokens != 0 || r.CacheWriteTokens != 0 {
+		t.Errorf("negative counters should be clamped to 0 in the report: %+v", r)
 	}
 }
 

@@ -63,4 +63,4 @@ func (s *responsesStream) Feed(_ string, data []byte) {
 	}
 }
 
-func (s *responsesStream) Usage() Usage { return s.u }
+func (s *responsesStream) Usage() Usage { return s.u.clamp() }

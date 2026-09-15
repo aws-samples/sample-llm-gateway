@@ -48,15 +48,17 @@ const (
 )
 
 // KeyAuthResult is the data part of the key-auth response.
+//
+// Only the fields the gateway actually reads are declared. The control plane also returns
+// keyCode / subjectType / remainingQuotaUsd; they are deliberately not decoded — a strictly
+// typed but unused field (e.g. float64 for a quota the CP may one day serialise as a string)
+// would make every key-auth fail decoding and turn into a fail-closed 503 for all traffic.
 type KeyAuthResult struct {
-	Valid             bool         `json:"valid"`
-	RejectReason      RejectReason `json:"rejectReason"`
-	Message           string       `json:"message"`
-	KeyCode           string       `json:"keyCode"`
-	SubjectType       string       `json:"subjectType"`
-	SubjectCode       string       `json:"subjectCode"`
-	ModelCode         string       `json:"modelCode"`
-	RemainingQuotaUSD float64      `json:"remainingQuotaUsd"`
+	Valid        bool         `json:"valid"`
+	RejectReason RejectReason `json:"rejectReason"`
+	Message      string       `json:"message"`
+	SubjectCode  string       `json:"subjectCode"`
+	ModelCode    string       `json:"modelCode"`
 }
 
 // UsageReport is the snake_case body of POST /admin/gateway/usage/report.
@@ -111,6 +113,12 @@ func New(baseURL, token, tokenHeader string) *Client {
 				MaxIdleConnsPerHost: 64,
 				IdleConnTimeout:     90 * time.Second,
 			},
+			// Never follow redirects. Go's default client strips Authorization/Cookie on a
+			// cross-host redirect but NOT custom headers, so the privileged control-plane
+			// token would be sent to whatever host a 3xx points at; a 307/308 would also
+			// replay the body (customer apiKey). A 3xx surfaces as a status error (fail-closed).
+			// Matches the upstream client in internal/proxy.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
@@ -145,9 +153,27 @@ func (c *Client) FetchRoutes(ctx context.Context, etag string) (*Routes, string,
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("model-routes: status %d: %s", resp.StatusCode, truncate(body))
 	}
-	var r Routes
-	if err := json.Unmarshal(body, &r); err != nil {
+	// Decode "models" as a raw message so a body with the key ABSENT is distinguishable from
+	// one where it is present and empty ("models": [] or "models": null — both a legitimate
+	// empty table). Any JSON object (an ApiResult-wrapped body, an error page, an unrelated
+	// document) would otherwise decode into Routes{} without error; at startup the empty-table
+	// guard in router.Poller.Sync does not apply, so the gateway would come up Ready with zero
+	// models and 404 every request with nothing in the logs.
+	var wire struct {
+		Version string          `json:"version"`
+		Models  json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
 		return nil, "", fmt.Errorf("model-routes: decode: %w", err)
+	}
+	if wire.Models == nil { // key absent (a JSON null would be the 4 bytes "null", not nil)
+		return nil, "", fmt.Errorf("model-routes: body has no \"models\" field (ApiResult-wrapped?): %s", truncate(body))
+	}
+	r := Routes{Version: wire.Version}
+	if string(wire.Models) != "null" {
+		if err := json.Unmarshal(wire.Models, &r.Models); err != nil {
+			return nil, "", fmt.Errorf("model-routes: decode models: %w", err)
+		}
 	}
 	newETag := resp.Header.Get("ETag")
 	if newETag == "" {
@@ -211,7 +237,9 @@ func (c *Client) postJSON(ctx context.Context, path string, payload []byte, out 
 	if err != nil {
 		return &RetryableError{Err: err}
 	}
-	if resp.StatusCode >= 500 {
+	// 5xx, 429 (rate limited) and 408 (request timeout) are transient: the caller backs off
+	// and retries. Everything else non-200 is terminal.
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusRequestTimeout {
 		return &RetryableError{Err: fmt.Errorf("status %d: %s", resp.StatusCode, truncate(body))}
 	}
 	if resp.StatusCode != http.StatusOK {
