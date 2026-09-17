@@ -21,6 +21,15 @@ const (
 	Anthropic       Protocol = config.EndpointAnthropic
 )
 
+// Valid reports whether p is one of the three supported wire protocols.
+func (p Protocol) Valid() bool {
+	switch p {
+	case OpenAIChat, OpenAIResponses, Anthropic:
+		return true
+	}
+	return false
+}
+
 // UpstreamPath is the path appended to the provider's base URL for each protocol.
 func (p Protocol) UpstreamPath() string {
 	switch p {

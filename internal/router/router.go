@@ -17,6 +17,7 @@ import (
 type Candidate struct {
 	ProviderCode      string
 	ProviderModelCode string
+	ProviderProtocol  string // wire protocol the provider speaks; empty = same as inbound (pass-through)
 	Priority          int
 	Weight            int
 }
@@ -47,7 +48,8 @@ func (r *Router) Load(routes *controlplane.Routes) {
 				w = 1
 			}
 			byPrio[p.Priority] = append(byPrio[p.Priority], Candidate{
-				ProviderCode: p.ProviderCode, ProviderModelCode: p.ProviderModelCode, Priority: p.Priority, Weight: w,
+				ProviderCode: p.ProviderCode, ProviderModelCode: p.ProviderModelCode,
+				ProviderProtocol: p.ProviderProtocol, Priority: p.Priority, Weight: w,
 			})
 		}
 		prios := make([]int, 0, len(byPrio))

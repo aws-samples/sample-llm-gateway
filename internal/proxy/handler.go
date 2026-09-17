@@ -25,6 +25,7 @@ import (
 	"github.com/aws-samples/sample-llm-gateway/internal/metering"
 	"github.com/aws-samples/sample-llm-gateway/internal/observability"
 	"github.com/aws-samples/sample-llm-gateway/internal/protocol"
+	"github.com/aws-samples/sample-llm-gateway/internal/protocol/translate"
 	"github.com/aws-samples/sample-llm-gateway/internal/provider"
 	"github.com/aws-samples/sample-llm-gateway/internal/router"
 )
@@ -174,10 +175,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastErr = fmt.Errorf("provider %q not configured", cand.ProviderCode)
 			continue
 		}
-		base, ok := prov.Endpoint(string(proto))
+		// Target protocol = what this provider speaks. Empty providerProtocol means "same as
+		// inbound" (pass-through, the historical behavior). When it differs, the gateway must
+		// translate between the two protocols.
+		targetProto := proto
+		if cand.ProviderProtocol != "" {
+			tp := protocol.Protocol(cand.ProviderProtocol)
+			if !tp.Valid() {
+				log.Error("route has unknown providerProtocol", "provider", cand.ProviderCode, "providerProtocol", cand.ProviderProtocol)
+				lastErr = fmt.Errorf("provider %q has unknown providerProtocol %q", cand.ProviderCode, cand.ProviderProtocol)
+				continue
+			}
+			targetProto = tp
+		}
+		base, ok := prov.Endpoint(string(targetProto))
 		if !ok {
-			log.Warn("provider lacks endpoint for protocol", "provider", cand.ProviderCode)
-			lastErr = fmt.Errorf("provider %q does not serve %s", cand.ProviderCode, proto)
+			log.Warn("provider lacks endpoint for protocol", "provider", cand.ProviderCode, "protocol", targetProto)
+			lastErr = fmt.Errorf("provider %q does not serve %s", cand.ProviderCode, targetProto)
+			continue
+		}
+		if targetProto != proto && !translate.Supported(proto, targetProto) {
+			// Cross-protocol route whose direction has no codec yet: skip this candidate so
+			// failover can try the next one. translate.Supported is the single switch that
+			// turns directions on as their codecs land; pass-through routes (providerProtocol
+			// empty → targetProto == proto) never reach this branch.
+			log.Warn("protocol translation not supported", "inbound", proto, "target", targetProto, "provider", cand.ProviderCode)
+			lastErr = fmt.Errorf("protocol translation %s -> %s not supported", proto, targetProto)
+			continue
+		}
+		if targetProto != proto {
+			// Direction is supported by translate but the relay wiring lands in a later
+			// milestone; until then treat it like unsupported so nothing half-works.
+			log.Warn("protocol translation wiring pending", "inbound", proto, "target", targetProto)
+			lastErr = fmt.Errorf("protocol translation %s -> %s not wired", proto, targetProto)
 			continue
 		}
 		lastCand = &cand

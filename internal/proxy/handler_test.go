@@ -138,6 +138,7 @@ type harness struct {
 	cp  *fakeCP
 	up  *fakeUpstream
 	up2 *fakeUpstream
+	rt  *router.Router
 }
 
 func newHarness(t *testing.T) *harness {
@@ -196,7 +197,7 @@ func newHarness(t *testing.T) *harness {
 	mux.Handle("/", h)
 	gw := httptest.NewServer(mux)
 	t.Cleanup(gw.Close)
-	return &harness{gw: gw, cp: cp, up: up, up2: up2}
+	return &harness{gw: gw, cp: cp, up: up, up2: up2, rt: rt}
 }
 
 func post(t *testing.T, url, key, body string, hdr map[string]string) (*http.Response, string) {
@@ -332,6 +333,61 @@ func TestNegativeUsageDoesNotPanicAndStillReports(t *testing.T) {
 	r := reps[0]
 	if r.StatusCode != 200 || r.InputTokens != 0 || r.OutputTokens != 0 || r.CacheReadTokens != 0 || r.CacheWriteTokens != 0 {
 		t.Errorf("negative counters should be clamped to 0 in the report: %+v", r)
+	}
+}
+
+// M2: providerProtocol == inbound protocol is still pass-through (no translation), works as today.
+func TestProviderProtocolSameAsInboundPassesThrough(t *testing.T) {
+	h := newHarness(t)
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		{ModelCode: "claude-same", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "global.anthropic.claude-x",
+				ProviderProtocol: "anthropic", Priority: 1, Weight: 100},
+		}},
+	}})
+	resp, body := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"claude-same","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("providerProtocol==inbound should pass through, got %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "msg_1") {
+		t.Errorf("expected upstream body, got %s", body)
+	}
+}
+
+// M2: providerProtocol different from inbound is guarded (translation not implemented yet):
+// the candidate is rejected, upstream is not called, and existing routes are unaffected.
+func TestProviderProtocolDifferentRejectedUntilImplemented(t *testing.T) {
+	h := newHarness(t)
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		{ModelCode: "claude-to-gpt", Providers: []controlplane.ProviderRoute{
+			// inbound will be anthropic (/v1/messages); target openai_chat, which "primary" serves.
+			{ProviderCode: "primary", ProviderModelCode: "gpt-x-real",
+				ProviderProtocol: "openai_chat", Priority: 1, Weight: 100},
+		}},
+	}})
+	resp, body := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"claude-to-gpt","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 502 {
+		t.Fatalf("cross-protocol route should fail (not implemented), got %d %s", resp.StatusCode, body)
+	}
+	h.up.mu.Lock()
+	called := h.up.lastBody != nil
+	h.up.mu.Unlock()
+	if called {
+		t.Error("upstream must not be called when translation is unsupported")
+	}
+}
+
+// M2: an unknown providerProtocol value is rejected, not treated as pass-through.
+func TestProviderProtocolUnknownRejected(t *testing.T) {
+	h := newHarness(t)
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		{ModelCode: "bogus-proto", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "x", ProviderProtocol: "grpc", Priority: 1, Weight: 100},
+		}},
+	}})
+	resp, _ := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"bogus-proto","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 502 {
+		t.Fatalf("unknown providerProtocol should be rejected, got %d", resp.StatusCode)
 	}
 }
 
