@@ -61,12 +61,19 @@ type chatChunk struct {
 			} `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 	} `json:"choices"`
-	Usage *chatUsage `json:"usage"`
+	// Usage stays raw and is handed to protocol.ParseUsage untouched, so the counters the client
+	// sees are exactly the ones metering bills. A typed struct here silently dropped the
+	// provider-specific cache-write fields (Bedrock's cache_creation_input_tokens) and the two
+	// disagreed on a real Claude Code run.
+	Usage json.RawMessage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error,omitempty"`
 }
+
+// hasUsage reports whether the chunk carries a usage object (include_usage final chunk).
+func (c *chatChunk) hasUsage() bool { return len(c.Usage) > 0 && string(c.Usage) != "null" }
 
 func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 	if len(data) == 0 {
@@ -88,9 +95,8 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 		s.id, s.model = c.ID, c.Model
 		out = append(out, StreamEvent{Kind: EventMessageStart, ID: c.ID, Model: c.Model})
 	}
-	if c.Usage != nil {
-		raw, _ := json.Marshal(map[string]any{"usage": c.Usage})
-		s.usage = protocol.ParseUsage(protocol.OpenAIChat, raw)
+	if c.hasUsage() {
+		s.usage = protocol.ParseUsage(protocol.OpenAIChat, append(append([]byte(`{"usage":`), c.Usage...), '}'))
 	}
 	for _, ch := range c.Choices {
 		if ch.Index != 0 {
@@ -149,7 +155,7 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 	}
 	// With include_usage the usage chunk comes after finish_reason; emit MessageStop once we
 	// have both (or at [DONE] as a fallback).
-	if s.finish != nil && c.Usage != nil {
+	if s.finish != nil && c.hasUsage() {
 		out = append(out, s.finishIfNeeded()...)
 	}
 	return out, nil

@@ -123,3 +123,33 @@ func TestStreamEndedAfterMessageStop(t *testing.T) {
 		t.Errorf("terminal event missing or Fail not idempotent:\n%s", all)
 	}
 }
+
+// Regression (found on a real Claude Code → GPT run): the usage the client sees must be the
+// same split metering bills. Bedrock's Chat usage carries the non-standard
+// prompt_tokens_details.cache_write_tokens; the decoder used to drop it, so the client saw
+// input_tokens=14331/cache_write=0 while the account said input=2/cache_write=14329.
+func TestChatStreamUsageMatchesMeteringSplit(t *testing.T) {
+	tr, _ := New(protocol.Anthropic, protocol.OpenAIChat, Options{})
+	st := tr.NewStream()
+	chunks := []string{
+		`{"choices":[{"delta":{"role":"assistant","content":"5"},"finish_reason":null,"index":0}],"id":"chatcmpl-1","model":"us.openai.gpt-5.6-sol","object":"chat.completion.chunk","usage":null}`,
+		`{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"id":"chatcmpl-1","model":"us.openai.gpt-5.6-sol","object":"chat.completion.chunk","usage":null}`,
+		`{"choices":[],"id":"chatcmpl-1","model":"us.openai.gpt-5.6-sol","object":"chat.completion.chunk","usage":{"completion_tokens":29,"completion_tokens_details":{"accepted_prediction_tokens":0,"audio_tokens":0,"reasoning_tokens":0,"rejected_prediction_tokens":0},"prompt_tokens":14331,"prompt_tokens_details":{"audio_tokens":0,"cache_write_tokens":14329,"cached_tokens":0},"total_tokens":14360}}`,
+		`[DONE]`,
+	}
+	var all []byte
+	for _, c := range chunks {
+		out, err := st.Feed("", []byte(c))
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, out...)
+	}
+	metering := protocol.ParseUsage(protocol.OpenAIChat, []byte(`{"usage":{"prompt_tokens":14331,"completion_tokens":29,"prompt_tokens_details":{"cache_write_tokens":14329,"cached_tokens":0}}}`))
+	if got := st.Usage(); got.Input != metering.Input || got.CacheWrite != metering.CacheWrite || got.Output != metering.Output {
+		t.Errorf("client usage %+v != metering usage %+v", got, metering)
+	}
+	if !strings.Contains(string(all), `"input_tokens":2,"output_tokens":29,"cache_read_input_tokens":0,"cache_creation_input_tokens":14329`) {
+		t.Errorf("message_delta usage must carry the metering split:\n%s", all)
+	}
+}

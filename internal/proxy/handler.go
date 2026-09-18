@@ -524,12 +524,20 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 		event = ""
 		data.Reset()
 	}
-	for sc.Scan() && res.translateErr == nil {
+	// done: the translated stream has delivered its terminal event. From the client's point of
+	// view the response is complete, so stop reading right away instead of waiting for the
+	// upstream EOF. Agentic clients (Codex) close the connection the moment they see the terminal
+	// event; waiting would let that close cancel ctx, fail the upstream read with "context
+	// canceled" and misclassify a fully delivered response as client_disconnect (unbilled).
+	// By construction every codec has seen the usage-bearing event before it emits MessageStop.
+	done := false
+	for !done && res.translateErr == nil && sc.Scan() {
 		line := sc.Bytes()
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		switch {
 		case len(line) == 0:
 			dispatch()
+			done = st != nil && st.Ended()
 		case bytes.HasPrefix(line, []byte("event:")):
 			event = string(bytes.TrimSpace(line[6:]))
 		case bytes.HasPrefix(line, []byte("data:")):
@@ -541,7 +549,7 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 		dispatch()
 	}
 	res.clientErr = fw.err
-	if err := sc.Err(); err != nil {
+	if err := sc.Err(); err != nil && !done {
 		res.upstreamErr = err
 		if fw.err == nil {
 			h.log.Warn("upstream stream ended with error", "err", err)
