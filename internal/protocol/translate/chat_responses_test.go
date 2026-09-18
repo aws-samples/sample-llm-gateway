@@ -77,7 +77,7 @@ func TestResponsesToChat_Codex_ToolOutputFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := openAIChatRequest{}.FromIR(ir, "gpt-real", Options{})
+	out, err := openAIChatRequest{}.FromIR(ir, "gpt-real", Options{TargetIsBedrock: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,17 @@ func TestResponsesToChat_Codex_ToolOutputFollowup(t *testing.T) {
 		t.Errorf("include_usage must be forced for a Chat upstream: %v", m["stream_options"])
 	}
 	if m["reasoning_effort"] != "none" {
-		t.Errorf("tools present → reasoning_effort none (Bedrock gpt-5.x on /chat/completions): %v", m["reasoning_effort"])
+		t.Errorf("tools present + Bedrock target → reasoning_effort none (Bedrock gpt-5.x on /chat/completions): %v", m["reasoning_effort"])
+	}
+
+	// Same input to a NON-Bedrock target must NOT carry reasoning_effort: a direct OpenAI model
+	// that does not accept the field would 400 on it.
+	outDirect, err := openAIChatRequest{}.FromIR(ir, "gpt-real", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md := mustJSON(t, outDirect); md["reasoning_effort"] != nil {
+		t.Errorf("non-Bedrock target must not set reasoning_effort, got %v", md["reasoning_effort"])
 	}
 	if _, has := m["max_completion_tokens"]; has {
 		t.Errorf("Codex omits max_output_tokens; Chat does not require it, so nothing must be defaulted: %v", m["max_completion_tokens"])

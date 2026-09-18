@@ -85,7 +85,7 @@ type chatToolDef struct {
 
 // ---- FromIR -----------------------------------------------------------------------------
 
-func (openAIChatRequest) FromIR(r *Request, providerModel string, _ Options) ([]byte, error) {
+func (openAIChatRequest) FromIR(r *Request, providerModel string, opts Options) ([]byte, error) {
 	w := chatReq{
 		Model:             providerModel,
 		Temperature:       r.Temperature,
@@ -122,11 +122,12 @@ func (openAIChatRequest) FromIR(r *Request, providerModel string, _ Options) ([]
 		}
 		w.Tools = append(w.Tools, chatTool{Type: "function", Function: chatToolDef{Name: t.Name, Description: t.Description, Parameters: params}})
 	}
-	if len(w.Tools) > 0 {
+	if len(w.Tools) > 0 && opts.TargetIsBedrock {
 		// Observed on Bedrock (us.openai.gpt-5.6-*): /v1/chat/completions rejects function tools
 		// unless reasoning_effort is "none" ("To use function tools, use /v1/responses or set
 		// reasoning_effort to 'none'"). Chat Completions has no slot to replay reasoning anyway,
-		// so nothing is lost by turning it off on this path.
+		// so nothing is lost by turning it off on this path. Only Bedrock targets get this — a
+		// direct OpenAI model that does not accept reasoning_effort would 400 on it.
 		w.ReasoningEffort = "none"
 	}
 	switch r.ToolChoice.Mode {

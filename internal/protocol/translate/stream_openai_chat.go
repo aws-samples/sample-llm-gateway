@@ -28,7 +28,8 @@ type chatStreamIn struct {
 	finish     *string
 	hasTools   bool
 	textOpen   bool
-	toolsOpen  map[int]bool // tool_calls index → we have emitted ToolUseStart
+	toolState  map[int]int // tool_calls index → toolUnseen / toolOpen / toolClosed
+	curTool    int         // source index of the currently open tool block, -1 if none
 	toolIDs    map[int]string
 	toolNames  map[int]string
 	usage      protocol.Usage
@@ -36,8 +37,18 @@ type chatStreamIn struct {
 	reasonOpen bool
 }
 
+// Tool-call lifecycle inside the Chat stream. The IR contract (see StreamEvent in ir.go) is that
+// tool blocks never overlap: a tool's ToolUseStop must be emitted before the next ToolUseStart.
+// Chat groups all tool_calls under a single terminal finish_reason instead of closing each one, so
+// this decoder tracks the currently open source index and closes it the moment a new index appears.
+const (
+	toolUnseen = iota // zero value; index absent from toolState == not yet seen
+	toolOpen
+	toolClosed
+)
+
 func newChatStreamIn() *chatStreamIn {
-	return &chatStreamIn{toolsOpen: map[int]bool{}, toolIDs: map[int]string{}, toolNames: map[int]string{}}
+	return &chatStreamIn{toolState: map[int]int{}, curTool: -1, toolIDs: map[int]string{}, toolNames: map[int]string{}}
 }
 
 type chatChunk struct {
@@ -119,8 +130,18 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 			s.hasTools = true
 			// Tool indexes are offset by 1 so they never collide with the single text slot (0).
 			idx := tc.Index + 1
-			if !s.toolsOpen[tc.Index] {
-				s.toolsOpen[tc.Index] = true
+			switch s.toolState[tc.Index] {
+			case toolClosed:
+				// A fragment for a tool we already closed. Real autoregressive upstreams never
+				// interleave tool indexes (all of tool N's fragments arrive before N+1 opens), so
+				// this breaks the IR non-overlap contract. Fail loudly (handler → stream_error)
+				// rather than silently splitting the arguments across two blocks (design §7).
+				return nil, fmt.Errorf("openai chat stream: tool index %d got a fragment after it was closed (interleaved tool calls unsupported)", tc.Index)
+			case toolUnseen:
+				// A new tool begins: close the previously open one first so blocks never overlap.
+				out = append(out, s.closeCurrentTool()...)
+				s.toolState[tc.Index] = toolOpen
+				s.curTool = tc.Index
 				s.toolIDs[tc.Index] = tc.ID
 				s.toolNames[tc.Index] = tc.Function.Name
 				if s.reasonOpen {
@@ -128,7 +149,7 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 					out = append(out, StreamEvent{Kind: EventThinkingDone, Index: -1})
 				}
 				out = append(out, StreamEvent{Kind: EventToolUseStart, Index: idx, ToolCallID: tc.ID, ToolName: tc.Function.Name})
-			} else {
+			case toolOpen:
 				// Later fragments may repeat id/name; fill in if the first fragment lacked them.
 				if s.toolIDs[tc.Index] == "" && tc.ID != "" {
 					s.toolIDs[tc.Index] = tc.ID
@@ -144,13 +165,8 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 		if ch.FinishReason != nil && *ch.FinishReason != "" {
 			f := *ch.FinishReason
 			s.finish = &f
-			// Close all open tool calls now; the usage chunk follows separately.
-			for i := range s.toolsOpen {
-				if s.toolsOpen[i] {
-					out = append(out, StreamEvent{Kind: EventToolUseStop, Index: i + 1, ToolCallID: s.toolIDs[i], ToolName: s.toolNames[i]})
-					s.toolsOpen[i] = false
-				}
-			}
+			// Only the last tool can still be open; the usage chunk follows separately.
+			out = append(out, s.closeCurrentTool()...)
 		}
 	}
 	// With include_usage the usage chunk comes after finish_reason; emit MessageStop once we
@@ -161,18 +177,24 @@ func (s *chatStreamIn) ToIR(_ string, data []byte) ([]StreamEvent, error) {
 	return out, nil
 }
 
+// closeCurrentTool emits ToolUseStop for the tool block that is currently open (if any) and marks
+// it closed, so the IR stream never has two tool blocks open at once.
+func (s *chatStreamIn) closeCurrentTool() []StreamEvent {
+	if s.curTool < 0 {
+		return nil
+	}
+	i := s.curTool
+	s.curTool = -1
+	s.toolState[i] = toolClosed
+	return []StreamEvent{{Kind: EventToolUseStop, Index: i + 1, ToolCallID: s.toolIDs[i], ToolName: s.toolNames[i]}}
+}
+
 func (s *chatStreamIn) finishIfNeeded() []StreamEvent {
 	if s.stopSent || !s.started {
 		return nil
 	}
 	s.stopSent = true
-	var out []StreamEvent
-	for i := range s.toolsOpen { // safety: close anything still open
-		if s.toolsOpen[i] {
-			out = append(out, StreamEvent{Kind: EventToolUseStop, Index: i + 1, ToolCallID: s.toolIDs[i], ToolName: s.toolNames[i]})
-			s.toolsOpen[i] = false
-		}
-	}
+	out := s.closeCurrentTool() // safety: close anything still open (e.g. stream ended at [DONE])
 	if s.reasonOpen {
 		s.reasonOpen = false
 		out = append(out, StreamEvent{Kind: EventThinkingDone, Index: -1})

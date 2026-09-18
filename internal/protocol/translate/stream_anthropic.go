@@ -202,6 +202,7 @@ type anthropicStreamOut struct {
 	openIdx  int
 	openKind ContentKind
 	openTool string // tool call id → maps source Index to our block index
+	openSrc  int    // source Index of the currently open block, -1 if none (only set for tools)
 	srcToOut map[int]int
 	model    string
 	id       string
@@ -209,7 +210,7 @@ type anthropicStreamOut struct {
 }
 
 func newAnthropicStreamOut() *anthropicStreamOut {
-	return &anthropicStreamOut{openIdx: -1, srcToOut: map[int]int{}}
+	return &anthropicStreamOut{openIdx: -1, openSrc: -1, srcToOut: map[int]int{}}
 }
 
 func (s *anthropicStreamOut) FromIR(ev StreamEvent) ([]byte, error) {
@@ -277,7 +278,7 @@ func (s *anthropicStreamOut) FromIR(ev StreamEvent) ([]byte, error) {
 		out = append(out, s.closeOpen()...)
 		idx := s.nextIndex
 		s.nextIndex++
-		s.openIdx, s.openKind, s.openTool = idx, KindToolUse, ev.ToolCallID
+		s.openIdx, s.openKind, s.openTool, s.openSrc = idx, KindToolUse, ev.ToolCallID, ev.Index
 		s.srcToOut[ev.Index] = idx
 		id := ev.ToolCallID
 		if id == "" {
@@ -305,7 +306,7 @@ func (s *anthropicStreamOut) FromIR(ev StreamEvent) ([]byte, error) {
 		if idx, ok := s.srcToOut[ev.Index]; ok {
 			delete(s.srcToOut, ev.Index)
 			if s.openIdx == idx {
-				s.openIdx, s.openKind = -1, ""
+				s.openIdx, s.openKind, s.openSrc = -1, "", -1
 			}
 			return sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx}), nil
 		}
@@ -355,7 +356,14 @@ func (s *anthropicStreamOut) closeOpen() []byte {
 		return nil
 	}
 	idx := s.openIdx
-	s.openIdx, s.openKind = -1, ""
+	if s.openKind == KindToolUse && s.openSrc >= 0 {
+		// Drop the stale source→block mapping when a tool block is closed implicitly (by the next
+		// ToolUseStart, MessageStop or an error), so a later ToolUseStop for this index becomes a
+		// no-op instead of emitting a second content_block_stop. Bookkeeping stays correct
+		// regardless of what closed the block.
+		delete(s.srcToOut, s.openSrc)
+	}
+	s.openIdx, s.openKind, s.openSrc = -1, "", -1
 	return sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
 }
 

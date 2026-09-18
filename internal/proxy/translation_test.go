@@ -97,8 +97,11 @@ func TestTranslateAnthropicToChatNonStream(t *testing.T) {
 		tools[0].(map[string]any)["function"].(map[string]any)["name"] != "Read" {
 		t.Errorf("tools: %v", tools)
 	}
-	if up["reasoning_effort"] != "none" {
-		t.Errorf("reasoning_effort should be none when tools are present (Bedrock gpt-5.x), got %v", up["reasoning_effort"])
+	// The test "primary" provider is x-api-key (not aws_iam), so it is NOT a Bedrock target and
+	// must not get the Bedrock-only reasoning_effort=none quirk. (Bedrock behavior is covered at
+	// the codec level in translate/chat_responses_test.go.)
+	if up["reasoning_effort"] != nil {
+		t.Errorf("reasoning_effort must be absent for a non-Bedrock target, got %v", up["reasoning_effort"])
 	}
 	if len(hdr["Anthropic-Version"]) != 0 || len(hdr["Anthropic-Beta"]) != 0 {
 		t.Errorf("anthropic headers must not reach an OpenAI endpoint: %v", hdr)

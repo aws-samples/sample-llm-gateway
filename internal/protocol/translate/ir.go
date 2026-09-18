@@ -157,6 +157,15 @@ type Response struct {
 
 // StreamEventKind enumerates the canonical streaming events. A translator turns the source
 // protocol's SSE events into this sequence, then renders it into the target protocol's events.
+//
+// Non-overlap contract for tool blocks: a decoder MUST emit a tool call's EventToolUseStop before
+// the next EventToolUseStart — tool blocks never overlap in the IR stream. This holds physically
+// because generation is autoregressive: one tool call's argument tokens finish before the next
+// begins, so upstreams stream tool fragments strictly ordered by index (the index only lets later
+// fragments that omit id/name find their owner; it does not imply interleaving). Encoders rely on
+// this to keep their per-block bookkeeping (source-index → output-block maps) consistent; a decoder
+// that received an interleaved fragment for an already-closed index must return an error rather
+// than reopen the block (design §7: never silently produce a wrong-looking-but-plausible result).
 type StreamEventKind string
 
 const (

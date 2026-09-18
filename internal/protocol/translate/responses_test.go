@@ -196,6 +196,89 @@ func TestResponsesRoundTrip_Codex(t *testing.T) {
 	}
 }
 
+// A reasoning item must round-trip verbatim, including fields this codec does not model. Regression
+// for the bug where reasoning was captured by re-marshaling the typed responsesItem struct, which
+// silently dropped anything it did not model (fragile to OpenAI adding reasoning fields).
+func TestResponsesReasoningRoundTripsUnmodeledFields(t *testing.T) {
+	in := []byte(`{"model":"m","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"reasoning","id":"rs_1","encrypted_content":"ENC==","summary":[{"type":"summary_text","text":"t"}],"status":"completed","extra_future_field":{"depth":3},"another_new_one":"keep-me"}` +
+		`]}`)
+	ir, err := openAIResponsesRequest{}.ToIR(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := openAIResponsesRequest{}.FromIR(ir, "m", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The unmodeled fields must survive in the re-rendered reasoning item.
+	var got struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("re-parse: %v\n%s", err, out)
+	}
+	var reasoning map[string]any
+	for _, it := range got.Input {
+		if it["type"] == "reasoning" {
+			reasoning = it
+		}
+	}
+	if reasoning == nil {
+		t.Fatalf("no reasoning item in output: %s", out)
+	}
+	if reasoning["encrypted_content"] != "ENC==" {
+		t.Errorf("encrypted_content not preserved: %v", reasoning["encrypted_content"])
+	}
+	if reasoning["another_new_one"] != "keep-me" {
+		t.Errorf("unmodeled string field dropped: %v", reasoning)
+	}
+	if ef, _ := reasoning["extra_future_field"].(map[string]any); ef == nil || ef["depth"] != float64(3) {
+		t.Errorf("unmodeled object field dropped: %v", reasoning["extra_future_field"])
+	}
+
+	// Byte-for-byte: the re-rendered item must be the captured bytes, not a re-marshal through
+	// map[string]any (which reorders keys and renders big integers as 1e+16-style floats).
+	item := `{"type":"reasoning","id":"rs_2","encrypted_content":"ENC==","summary":[],"big_int":12345678901234567,"z_last":1,"a_first":2}`
+	ir2, err := openAIResponsesRequest{}.ToIR([]byte(`{"model":"m","input":[` + item + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, render := range []func() ([]byte, error){
+		func() ([]byte, error) { return openAIResponsesRequest{}.FromIR(ir2, "m", Options{}) },
+		func() ([]byte, error) {
+			resp := &Response{ID: "r", Model: "m", Content: ir2.Messages[0].Content, StopReason: StopEndTurn}
+			return openAIResponsesResponse{}.FromIR(resp)
+		},
+	} {
+		out, err := render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), item) {
+			t.Errorf("reasoning item not embedded verbatim:\n%s", out)
+		}
+	}
+	// Streaming encoder path too.
+	enc := newResponsesStreamOut()
+	var all []byte
+	for _, ev := range []StreamEvent{
+		{Kind: EventMessageStart, ID: "r", Model: "m"},
+		{Kind: EventThinkingDone, Index: -1, ThinkingRaw: json.RawMessage(item)},
+		{Kind: EventMessageStop, StopReason: StopEndTurn},
+	} {
+		b, err := enc.FromIR(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, b...)
+	}
+	if strings.Count(string(all), item) != 3 { // output_item.added, output_item.done, response.completed.output
+		t.Errorf("stream encoder must embed the reasoning item verbatim in all three places:\n%s", all)
+	}
+}
+
 // ---- Responses non-stream response → IR → Anthropic response ---------------------------------
 
 func TestResponsesResponseToAnthropic(t *testing.T) {

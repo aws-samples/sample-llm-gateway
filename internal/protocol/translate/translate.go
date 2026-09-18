@@ -47,6 +47,11 @@ type Options struct {
 	// not the 4096 many proxies copy from LiteLLM — that value silently truncates real work with
 	// a normal-looking stop_reason: max_tokens.
 	DefaultMaxTokens int64
+	// TargetIsBedrock enables Amazon Bedrock-only request quirks in the target codec. Today: an
+	// OpenAI Chat target carrying function tools gets reasoning_effort="none" (Bedrock's
+	// /chat/completions rejects tools otherwise). Left false for direct OpenAI and third-party
+	// OpenAI-compatible endpoints, which may reject or misinterpret that field.
+	TargetIsBedrock bool
 }
 
 // DefaultMaxTokens is the shipped default for Options.DefaultMaxTokens (see the field doc).

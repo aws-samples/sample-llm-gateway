@@ -201,7 +201,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// (providerProtocol empty → targetProto == proto) never enter this branch.
 		var tr *translate.Translator
 		if targetProto != proto {
-			t, err := translate.New(proto, targetProto, h.translateOptions())
+			opts := h.translateOptions()
+			opts.TargetIsBedrock = prov.IsBedrock()
+			t, err := translate.New(proto, targetProto, opts)
 			if err != nil {
 				log.Warn("protocol translation not supported", "inbound", proto, "target", targetProto, "provider", cand.ProviderCode)
 				lastErr = err
@@ -470,8 +472,12 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 			}
 			out, err := tr.Response(body)
 			if err != nil {
-				// Never hand the client a body in the wrong protocol: fail loudly as a 502.
+				// Never hand the client a body in the wrong protocol: fail loudly as a 502. The
+				// request never reached the client intact, so it is not billed — zero the usage
+				// that was parsed above, matching the streaming path (classifyTruncation) and the
+				// "failed request → tokens zeroed" policy.
 				res.translateErr = err
+				res.usage = protocol.Usage{}
 				h.log.Warn("protocol translation: response failed", "inbound", proto, "target", upProto, "err", err)
 				(&protocol.GatewayError{Status: http.StatusBadGateway, Type: "api_error", Code: "translation_error", Message: "protocol translation of upstream response failed: " + err.Error()}).Write(w, proto)
 				res.status = http.StatusBadGateway

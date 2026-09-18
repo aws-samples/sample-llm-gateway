@@ -59,6 +59,31 @@ type responsesItem struct {
 	EncryptedContent string          `json:"encrypted_content,omitempty"`
 	Summary          json.RawMessage `json:"summary,omitempty"`
 	Status           string          `json:"status,omitempty"`
+	// raw holds the item's original bytes so an opaque item (reasoning) can be replayed verbatim
+	// instead of being re-marshaled from the typed fields above, which would silently drop any
+	// field this struct does not model (e.g. a future reasoning field). Excluded from marshaling.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON keeps the original bytes in raw while decoding the modeled fields.
+func (it *responsesItem) UnmarshalJSON(b []byte) error {
+	type alias responsesItem
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*it = responsesItem(a)
+	it.raw = append(json.RawMessage(nil), b...)
+	return nil
+}
+
+// rawItem returns the original bytes if captured, else a best-effort re-marshal of the typed fields.
+func (it *responsesItem) rawItem() json.RawMessage {
+	if len(it.raw) > 0 {
+		return it.raw
+	}
+	b, _ := json.Marshal(it)
+	return b
 }
 
 type responsesPart struct {
@@ -152,9 +177,9 @@ func (openAIResponsesRequest) ToIR(body []byte) (*Request, error) {
 				case "function_call_output":
 					r.Messages = append(r.Messages, Message{Role: RoleTool, Content: []Content{{Kind: KindToolResult, ToolResultID: it.CallID, ToolResult: responsesOutputToIR(it.Output)}}})
 				case "reasoning":
-					// Opaque round-trip payload (encrypted_content); attach to the assistant turn.
-					raw, _ := json.Marshal(it)
-					r.Messages = appendAssistant(r.Messages, Content{Kind: KindThinking, ThinkingRaw: raw, Text: reasoningSummaryText(it.Summary)})
+					// Opaque round-trip payload (encrypted_content + any unmodeled fields); attach
+					// to the assistant turn verbatim so it replays byte-for-byte.
+					r.Messages = appendAssistant(r.Messages, Content{Kind: KindThinking, ThinkingRaw: it.rawItem(), Text: reasoningSummaryText(it.Summary)})
 				default:
 					return nil, fmt.Errorf("openai responses request: input[%d]: unsupported item type %q", i, it.Type)
 				}
@@ -376,9 +401,9 @@ func (openAIResponsesRequest) FromIR(r *Request, providerModel string, _ Options
 						Type string `json:"type"`
 					}
 					if len(c.ThinkingRaw) > 0 && json.Unmarshal(c.ThinkingRaw, &probe) == nil && probe.Type == "reasoning" {
-						var item map[string]any
-						_ = json.Unmarshal(c.ThinkingRaw, &item)
-						items = append(items, item)
+						// Embed the captured bytes verbatim: going through map[string]any would
+						// re-order keys and turn integers into float64 (1e+06-style output).
+						items = append(items, json.RawMessage(c.ThinkingRaw))
 					}
 					// Anthropic thinking (signature) cannot be replayed into Responses; dropped.
 				}
@@ -471,8 +496,8 @@ func (openAIResponsesResponse) ToIR(body []byte) (*Response, error) {
 			}
 			r.Content = append(r.Content, Content{Kind: KindToolUse, ToolCallID: it.CallID, ToolName: it.Name, ToolInput: args})
 		case "reasoning":
-			raw, _ := json.Marshal(it)
-			r.Content = append(r.Content, Content{Kind: KindThinking, ThinkingRaw: raw, Text: reasoningSummaryText(it.Summary)})
+			// Verbatim opaque payload (see rawItem): keeps fields this struct does not model.
+			r.Content = append(r.Content, Content{Kind: KindThinking, ThinkingRaw: it.rawItem(), Text: reasoningSummaryText(it.Summary)})
 		}
 	}
 	r.StopReason = responsesStatusToIR(w.Status, w.IncompleteDetails, hasTool)
@@ -534,9 +559,7 @@ func (openAIResponsesResponse) FromIR(r *Response) ([]byte, error) {
 				Type string `json:"type"`
 			}
 			if len(c.ThinkingRaw) > 0 && json.Unmarshal(c.ThinkingRaw, &probe) == nil && probe.Type == "reasoning" {
-				var item map[string]any
-				_ = json.Unmarshal(c.ThinkingRaw, &item)
-				output = append(output, item)
+				output = append(output, json.RawMessage(c.ThinkingRaw)) // verbatim, see request FromIR
 			} else if c.Text != "" {
 				// Visible reasoning from another protocol → summary-only reasoning item (not replayable).
 				output = append(output, map[string]any{"type": "reasoning", "id": "rs_" + randomID(), "summary": []map[string]any{{"type": "summary_text", "text": c.Text}}})

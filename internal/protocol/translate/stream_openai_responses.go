@@ -224,6 +224,7 @@ type respOutItem struct {
 	name   string
 	text   string
 	args   string
+	srcIdx int // source Index this item maps from (for cleaning up srcToItem when closed)
 }
 
 func newResponsesStreamOut() *responsesStreamOut {
@@ -295,8 +296,7 @@ func (s *responsesStreamOut) FromIR(ev StreamEvent) ([]byte, error) {
 			}
 			if json.Unmarshal(ev.ThinkingRaw, &probe) == nil && probe.Type == "reasoning" {
 				out = append(out, s.closeOpen()...)
-				var item map[string]any
-				_ = json.Unmarshal(ev.ThinkingRaw, &item)
+				item := json.RawMessage(ev.ThinkingRaw) // verbatim; map[string]any would float64/reorder
 				idx := s.nextOut
 				s.nextOut++
 				out = append(out, s.frame(map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})...)
@@ -316,7 +316,7 @@ func (s *responsesStreamOut) FromIR(ev StreamEvent) ([]byte, error) {
 		if callID == "" {
 			callID = "call_" + randomID()
 		}
-		it := &respOutItem{kind: KindToolUse, outIdx: s.nextOut, itemID: "fc_" + randomID(), callID: callID, name: ev.ToolName}
+		it := &respOutItem{kind: KindToolUse, outIdx: s.nextOut, itemID: "fc_" + randomID(), callID: callID, name: ev.ToolName, srcIdx: ev.Index}
 		s.nextOut++
 		s.open = it
 		s.srcToItem[ev.Index] = it
@@ -386,6 +386,9 @@ func (s *responsesStreamOut) closeOpen() []byte {
 		s.output = append(s.output, item)
 		return s.frame(map[string]any{"type": "response.output_item.done", "output_index": it.outIdx, "item": item})
 	case KindToolUse:
+		// Drop the stale source→item mapping so a later ToolUseStop for this index is a no-op
+		// instead of appending the tool call to the output array a second time.
+		delete(s.srcToItem, it.srcIdx)
 		return s.closeTool(it)
 	}
 	return nil
