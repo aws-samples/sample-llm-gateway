@@ -319,3 +319,162 @@ func mustMarshal(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// ---- the remaining four directions (M8) ------------------------------------------------------
+//
+// One table entry per direction, non-stream and stream, through the handler. Each checks the
+// client-side envelope, one upstream-body property proving the target codec ran, and the metering
+// report parsed from the upstream protocol.
+
+func loadRemainingDirectionRoutes(h *harness) {
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		// backup serves openai_responses (fake up2); primary serves anthropic + openai_chat (fake up).
+		{ModelCode: "chat-to-responses", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "backup", ProviderModelCode: "gpt-x-real", ProviderProtocol: "openai_responses", Priority: 1, Weight: 100}}},
+		{ModelCode: "chat-to-claude", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "global.anthropic.claude-x", ProviderProtocol: "anthropic", Priority: 1, Weight: 100}}},
+		{ModelCode: "claude-to-responses", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "backup", ProviderModelCode: "gpt-x-real", ProviderProtocol: "openai_responses", Priority: 1, Weight: 100}}},
+		{ModelCode: "responses-to-chat", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "gpt-x-real", ProviderProtocol: "openai_chat", Priority: 1, Weight: 100}}},
+	}})
+}
+
+func TestTranslateRemainingDirections(t *testing.T) {
+	type rep struct{ in, out, cr, cw, rs int64 }
+	cases := []struct {
+		name, path, body string
+		upstream         func(h *harness) *fakeUpstream
+		wantClient       []string // substrings the client body must contain
+		wantUpstream     func(t *testing.T, up map[string]any)
+		wantReport       rep
+	}{
+		{
+			name: "chat→responses non-stream", path: "/v1/chat/completions",
+			body:       `{"model":"chat-to-responses","messages":[{"role":"system","content":"terse"},{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up2 },
+			wantClient: []string{`"object":"chat.completion"`, `"content":"hi"`, `"finish_reason":"stop"`, `"prompt_tokens":30`, `"cached_tokens":10`},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if up["model"] != "gpt-x-real" || up["store"] != false || up["instructions"] != "terse" || up["input"] == nil || up["messages"] != nil {
+					t.Errorf("responses upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 20, out: 6, cr: 10, rs: 2},
+		},
+		{
+			name: "chat→responses stream", path: "/v1/chat/completions",
+			body:       `{"model":"chat-to-responses","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up2 },
+			wantClient: []string{`"object":"chat.completion.chunk"`, `"role":"assistant"`, `"content":"hi"`, `"finish_reason":"stop"`, `"prompt_tokens":30`, "data: [DONE]"},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if up["stream"] != true || up["store"] != false {
+					t.Errorf("responses upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 20, out: 6, cr: 10, rs: 2},
+		},
+		{
+			name: "chat→anthropic non-stream", path: "/v1/chat/completions",
+			body:       `{"model":"chat-to-claude","messages":[{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up },
+			wantClient: []string{`"object":"chat.completion"`, `"content":"hi"`, `"prompt_tokens":16`, `"cached_tokens":3`, `"completion_tokens":7`},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				// SDK omitted max_tokens → gateway default; Chat-only fields stay out.
+				if up["max_tokens"] != float64(8192) || up["model"] != "global.anthropic.claude-x" || up["max_completion_tokens"] != nil {
+					t.Errorf("anthropic upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 11, out: 7, cr: 3, cw: 2},
+		},
+		{
+			name: "chat→anthropic stream", path: "/v1/chat/completions",
+			body:       `{"model":"chat-to-claude","stream":true,"max_tokens":40,"messages":[{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up },
+			wantClient: []string{`"object":"chat.completion.chunk"`, `"content":"hi"`, `"finish_reason":"stop"`, `"completion_tokens":9`, "data: [DONE]"},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if up["max_tokens"] != float64(40) || up["stream"] != true || up["stream_options"] != nil {
+					t.Errorf("anthropic upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 11, out: 9},
+		},
+		{
+			name: "anthropic→responses non-stream", path: "/v1/messages",
+			body:       `{"model":"claude-to-responses","max_tokens":64,"system":"terse","messages":[{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up2 },
+			wantClient: []string{`"type":"message"`, `"role":"assistant"`, `"text":"hi"`, `"stop_reason":"end_turn"`, `"input_tokens":20`, `"cache_read_input_tokens":10`},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if up["max_output_tokens"] != float64(64) || up["instructions"] != "terse" || up["store"] != false || up["system"] != nil || up["max_tokens"] != nil {
+					t.Errorf("responses upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 20, out: 6, cr: 10, rs: 2},
+		},
+		{
+			name: "anthropic→responses stream", path: "/v1/messages",
+			body:       `{"model":"claude-to-responses","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up2 },
+			wantClient: []string{"event: message_start", "event: content_block_delta", `"text":"hi"`, "event: message_delta", `"stop_reason":"end_turn"`, "event: message_stop"},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if up["stream"] != true {
+					t.Errorf("responses upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 20, out: 6, cr: 10, rs: 2},
+		},
+		{
+			name: "responses→chat non-stream", path: "/v1/responses",
+			body:       `{"model":"responses-to-chat","store":false,"instructions":"terse","input":"hi"}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up },
+			wantClient: []string{`"object":"response"`, `"status":"completed"`, `"type":"function_call"`, `"call_id":"call_9"`, `"output_text"`, `"input_tokens":20`, `"cached_tokens":15`},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				msgs, _ := up["messages"].([]any)
+				if len(msgs) != 2 || msgs[0].(map[string]any)["role"] != "system" || up["input"] != nil || up["store"] != nil {
+					t.Errorf("chat upstream body: %v", up)
+				}
+			},
+			wantReport: rep{in: 5, out: 4, cr: 15, rs: 2},
+		},
+		{
+			name: "responses→chat stream", path: "/v1/responses",
+			body:       `{"model":"responses-to-chat","store":false,"stream":true,"input":"hi"}`,
+			upstream:   func(h *harness) *fakeUpstream { return h.up },
+			wantClient: []string{`"type":"response.created"`, `"type":"response.output_text.delta"`, `"delta":"hi"`, `"type":"response.completed"`, `"status":"completed"`, `"output_tokens":4`},
+			wantUpstream: func(t *testing.T, up map[string]any) {
+				if so, _ := up["stream_options"].(map[string]any); so["include_usage"] != true {
+					t.Errorf("include_usage must be forced for a Chat upstream: %v", up)
+				}
+			},
+			wantReport: rep{in: 5, out: 4, cr: 15, rs: 2},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			loadRemainingDirectionRoutes(h)
+			resp, body := post(t, h.gw.URL+c.path, "sk-client", c.body, nil)
+			if resp.StatusCode != 200 {
+				t.Fatalf("status %d body %s", resp.StatusCode, body)
+			}
+			for _, want := range c.wantClient {
+				if !strings.Contains(body, want) {
+					t.Errorf("client body missing %q:\n%s", want, body)
+				}
+			}
+			up, _, _ := c.upstream(h).snapshot()
+			if up == nil {
+				t.Fatal("upstream not called")
+			}
+			c.wantUpstream(t, up)
+			reps := h.cp.waitReports(1)
+			if len(reps) != 1 {
+				t.Fatal("no usage report")
+			}
+			r := reps[0]
+			if r.StatusCode != 200 || r.InputTokens != c.wantReport.in || r.OutputTokens != c.wantReport.out ||
+				r.CacheReadTokens != c.wantReport.cr || r.CacheWriteTokens != c.wantReport.cw || r.ReasoningTokens != c.wantReport.rs {
+				t.Errorf("report %+v, want %+v", r, c.wantReport)
+			}
+		})
+	}
+}

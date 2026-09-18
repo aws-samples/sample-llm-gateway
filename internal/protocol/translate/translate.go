@@ -56,13 +56,14 @@ const DefaultMaxTokens int64 = 8192
 // Same-protocol pairs are pass-through and never go through this package. The proxy handler
 // treats a false result as "not implemented" and skips the candidate (failover continues).
 //
-// Directions live: Anthropic ↔ OpenAI Chat, Anthropic ↔ OpenAI Responses.
-// Pending (M8): OpenAI Chat ↔ OpenAI Responses.
+// All six cross-protocol directions between Anthropic Messages, OpenAI Chat Completions and
+// OpenAI Responses are implemented. The function stays as the single switch so a direction can
+// be pulled if a codec regresses.
 func Supported(from, to protocol.Protocol) bool {
 	if from == to || !from.Valid() || !to.Valid() {
 		return false
 	}
-	return from == protocol.Anthropic || to == protocol.Anthropic
+	return requestCodec(from) != nil && requestCodec(to) != nil
 }
 
 // ErrUnsupported is returned by New for a direction Supported() rejects.

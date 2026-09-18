@@ -13,7 +13,7 @@ func TestSupportedMatrix(t *testing.T) {
 	for _, from := range all {
 		for _, to := range all {
 			got := Supported(from, to)
-			want := from != to && (from == protocol.Anthropic || to == protocol.Anthropic) // Chat↔Responses lands in M8
+			want := from != to // all 6 cross-protocol directions; same-protocol is pass-through
 			if got != want {
 				t.Errorf("Supported(%s,%s)=%v want %v", from, to, got, want)
 			}
@@ -22,8 +22,11 @@ func TestSupportedMatrix(t *testing.T) {
 	if Supported("grpc", protocol.Anthropic) || Supported(protocol.Anthropic, "") {
 		t.Error("invalid protocols must not be supported")
 	}
-	if _, err := New(protocol.OpenAIChat, protocol.OpenAIResponses, Options{}); !errors.Is(err, ErrUnsupported) {
-		t.Errorf("New for unsupported direction: %v", err)
+	if _, err := New(protocol.OpenAIChat, protocol.OpenAIChat, Options{}); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("New for same-protocol pair: %v", err)
+	}
+	if _, err := New("grpc", protocol.Anthropic, Options{}); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("New for invalid protocol: %v", err)
 	}
 }
 

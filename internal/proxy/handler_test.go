@@ -123,6 +123,21 @@ func (u *fakeUpstream) handler() http.Handler {
 				fl.Flush()
 				time.Sleep(5 * time.Millisecond)
 			}
+		case strings.HasSuffix(r.URL.Path, "/responses") && !stream:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-x-real","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2},"total_tokens":36}}`)
+		case strings.HasSuffix(r.URL.Path, "/responses"):
+			// Data-only frames with data.type, as Bedrock/OpenAI emit them.
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, d := range []string{
+				`{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-x-real","output":[]}}`,
+				`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}`,
+				`{"type":"response.output_text.delta","sequence_number":2,"output_index":0,"content_index":0,"item_id":"msg_1","delta":"hi"}`,
+				`{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}}`,
+				`{"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-x-real","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2},"total_tokens":36}}}`,
+			} {
+				_, _ = fmt.Fprint(w, "data: "+d+"\n\n")
+			}
 		case strings.HasSuffix(r.URL.Path, "/chat/completions") && !stream:
 			// Non-stream chat completion with a tool call (exercises the Anthropic ← Chat codec).
 			w.Header().Set("Content-Type", "application/json")
@@ -369,30 +384,6 @@ func TestProviderProtocolSameAsInboundPassesThrough(t *testing.T) {
 	}
 	if !strings.Contains(body, "msg_1") {
 		t.Errorf("expected upstream body, got %s", body)
-	}
-}
-
-// A direction translate.Supported() does not (yet) cover is guarded: the candidate is skipped,
-// upstream is not called, and the request fails as 502 with the reason in the message.
-// OpenAI Chat ↔ Responses lands in M8; until then it is the canonical "unsupported" pair.
-func TestProviderProtocolUnsupportedDirectionRejected(t *testing.T) {
-	h := newHarness(t)
-	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
-		{ModelCode: "chat-to-responses", Providers: []controlplane.ProviderRoute{
-			// inbound openai_chat (/v1/chat/completions); target openai_responses, which "backup" serves.
-			{ProviderCode: "backup", ProviderModelCode: "gpt-x-real",
-				ProviderProtocol: "openai_responses", Priority: 1, Weight: 100},
-		}},
-	}})
-	resp, body := post(t, h.gw.URL+"/v1/chat/completions", "sk-client", `{"model":"chat-to-responses","messages":[{"role":"user","content":"hi"}]}`, nil)
-	if resp.StatusCode != 502 || !strings.Contains(body, "not supported") {
-		t.Fatalf("unsupported direction should fail with 502, got %d %s", resp.StatusCode, body)
-	}
-	h.up2.mu.Lock()
-	called := h.up2.lastBody != nil
-	h.up2.mu.Unlock()
-	if called {
-		t.Error("upstream must not be called when translation is unsupported")
 	}
 }
 
