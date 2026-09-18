@@ -194,31 +194,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastErr = fmt.Errorf("provider %q does not serve %s", cand.ProviderCode, targetProto)
 			continue
 		}
-		if targetProto != proto && !translate.Supported(proto, targetProto) {
-			// Cross-protocol route whose direction has no codec yet: skip this candidate so
-			// failover can try the next one. translate.Supported is the single switch that
-			// turns directions on as their codecs land; pass-through routes (providerProtocol
-			// empty → targetProto == proto) never reach this branch.
-			log.Warn("protocol translation not supported", "inbound", proto, "target", targetProto, "provider", cand.ProviderCode)
-			lastErr = fmt.Errorf("protocol translation %s -> %s not supported", proto, targetProto)
-			continue
-		}
+		// Cross-protocol route: build the translator for this direction. translate.Supported is
+		// the single switch that turns directions on as their codecs land; an unsupported
+		// direction skips the candidate so failover can try the next one. Pass-through routes
+		// (providerProtocol empty → targetProto == proto) never enter this branch.
+		var tr *translate.Translator
 		if targetProto != proto {
-			// Direction is supported by translate but the relay wiring lands in a later
-			// milestone; until then treat it like unsupported so nothing half-works.
-			log.Warn("protocol translation wiring pending", "inbound", proto, "target", targetProto)
-			lastErr = fmt.Errorf("protocol translation %s -> %s not wired", proto, targetProto)
-			continue
+			t, err := translate.New(proto, targetProto, h.translateOptions())
+			if err != nil {
+				log.Warn("protocol translation not supported", "inbound", proto, "target", targetProto, "provider", cand.ProviderCode)
+				lastErr = err
+				continue
+			}
+			tr = t
 		}
 		lastCand = &cand
 
-		upBody, err := preq.Rewrite(proto, cand.ProviderModelCode)
-		if err != nil {
-			protocol.ErrBadRequest("failed to rewrite request body").Write(w, proto)
-			return
+		var upBody []byte
+		if tr == nil {
+			upBody, err = preq.Rewrite(proto, cand.ProviderModelCode)
+			if err != nil {
+				protocol.ErrBadRequest("failed to rewrite request body").Write(w, proto)
+				return
+			}
+		} else {
+			// The inbound body is re-rendered in the target protocol. A failure here is a
+			// property of the client's body (unsupported field, e.g. previous_response_id), so
+			// it is a 400 in the client's own format rather than a failover: every other
+			// translating candidate would fail identically.
+			var defaulted bool
+			upBody, defaulted, err = tr.Request(body, cand.ProviderModelCode)
+			if err != nil {
+				h.metrics.Translations.WithLabelValues(string(proto), string(targetProto), "request_error").Inc()
+				log.Warn("protocol translation: request rejected", "inbound", proto, "target", targetProto, "err", err)
+				protocol.ErrBadRequest("protocol translation: "+err.Error()).Write(w, proto)
+				return
+			}
+			if defaulted {
+				h.metrics.TranslationDefaults.WithLabelValues("max_tokens").Inc()
+				log.Debug("protocol translation: max_tokens defaulted", "target", targetProto, "max_tokens", h.translateOptions().DefaultMaxTokens)
+			}
 		}
 		upURL := *base
-		upURL.Path = strings.TrimRight(base.Path, "/") + proto.UpstreamPath()
+		upURL.Path = strings.TrimRight(base.Path, "/") + targetProto.UpstreamPath()
 		// upURL 只由配置里的 provider base URL 加协议固定路径拼成，不含任何客户端输入（客户端只能影响请求体）。
 		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL.String(), bytes.NewReader(upBody)) // nosemgrep: gosec.G107-1
 		if err != nil {
@@ -226,10 +244,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		upReq.ContentLength = int64(len(upBody))
-		copyRequestHeaders(r.Header, upReq.Header)
+		copyRequestHeaders(r.Header, upReq.Header, targetProto, tr != nil)
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", userAgent)
-		if proto == protocol.Anthropic && upReq.Header.Get("anthropic-version") == "" {
+		if targetProto == protocol.Anthropic && upReq.Header.Get("anthropic-version") == "" {
 			upReq.Header.Set("anthropic-version", defaultAnthropicVers)
 		}
 		if err := prov.Authenticate(ctx, upReq, upBody); err != nil {
@@ -263,9 +281,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Commit to this response.
-		outcome = h.relay(w, resp, proto, attemptStart)
+		outcome = h.relay(w, resp, proto, tr, attemptStart)
 		outcome.provider = cand
 		classifyTruncation(outcome, ctx, r.Context())
+		if tr != nil {
+			h.metrics.Translations.WithLabelValues(string(proto), string(targetProto), outcome.translationResult()).Inc()
+		}
 		break
 	}
 
@@ -335,13 +356,26 @@ func (h *Handler) report(reqID, apiKey, model, providerModel string, start time.
 }
 
 type relayResult struct {
-	status      int
-	ttft        time.Duration
-	usage       protocol.Usage
-	provider    router.Candidate
-	clientErr   error  // writing to the client failed (client went away)
-	upstreamErr error  // the upstream stream ended with an error instead of a clean EOF
-	truncated   string // set by classifyTruncation: request_timeout / client_disconnect / upstream_stream_error
+	status       int
+	ttft         time.Duration
+	usage        protocol.Usage
+	provider     router.Candidate
+	clientErr    error  // writing to the client failed (client went away)
+	upstreamErr  error  // the upstream stream ended with an error instead of a clean EOF
+	translateErr error  // protocol translation of the response/stream failed (gateway-side)
+	truncated    string // set by classifyTruncation: request_timeout / client_disconnect / upstream_stream_error / translation_error
+}
+
+// translationResult is the `result` label for llmgw_translations_total.
+func (r *relayResult) translationResult() string {
+	switch {
+	case r.translateErr == nil:
+		return "ok"
+	case r.truncated != "": // only streams get truncation-classified
+		return "stream_error"
+	default:
+		return "response_error"
+	}
 }
 
 // StatusClientClosedRequest is nginx's convention for "client went away before the response
@@ -361,16 +395,39 @@ func classifyTruncation(res *relayResult, reqCtx, clientCtx context.Context) {
 		res.truncated, res.status = "request_timeout", http.StatusGatewayTimeout
 	case res.clientErr != nil || clientCtx.Err() != nil:
 		res.truncated, res.status = "client_disconnect", StatusClientClosedRequest
+	case res.translateErr != nil:
+		// The gateway could not render an upstream event for the client; the client got an
+		// error event and the message is incomplete. Not billed, like any other truncation.
+		res.truncated, res.status = "translation_error", http.StatusBadGateway
 	default:
 		res.truncated, res.status = "upstream_stream_error", http.StatusBadGateway
 	}
 	res.usage = protocol.Usage{}
 }
 
+// translateOptions builds the conversion knobs from config; 0 means the built-in default.
+func (h *Handler) translateOptions() translate.Options {
+	opts := translate.Options{DefaultMaxTokens: h.cfg.Server.DefaultMaxTokens}
+	if opts.DefaultMaxTokens == 0 {
+		opts.DefaultMaxTokens = translate.DefaultMaxTokens
+	}
+	return opts
+}
+
 // relay streams the upstream response to the client while extracting usage.
-func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protocol.Protocol, attemptStart time.Time) *relayResult {
+//
+// proto is the client's protocol (error rendering). tr is nil for pass-through; when set, the
+// upstream speaks tr.To and every byte is re-rendered into proto before it reaches the client.
+// Metering always parses the RAW upstream bytes with the upstream protocol's parser, so the
+// account is exactly what pass-through of that protocol would have produced and does not depend
+// on the codecs.
+func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protocol.Protocol, tr *translate.Translator, attemptStart time.Time) *relayResult {
 	defer resp.Body.Close()
 	res := &relayResult{status: resp.StatusCode}
+	upProto := proto
+	if tr != nil {
+		upProto = tr.To
+	}
 	for _, k := range forwardResponseHeaders {
 		if v := resp.Header.Get(k); v != "" {
 			w.Header().Set(k, v)
@@ -399,8 +456,28 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 			res.status = http.StatusBadGateway
 			return res
 		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			res.usage = protocol.ParseUsage(proto, body)
+		ok2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
+		if ok2xx {
+			res.usage = protocol.ParseUsage(upProto, body)
+		}
+		if tr != nil {
+			if !ok2xx {
+				// The upstream error body is in the provider's wire format; the client speaks
+				// another one. Re-render it (status preserved) so SDKs can still parse it.
+				tr.Error(resp.StatusCode, body).Write(w, proto)
+				return res
+			}
+			out, err := tr.Response(body)
+			if err != nil {
+				// Never hand the client a body in the wrong protocol: fail loudly as a 502.
+				res.translateErr = err
+				h.log.Warn("protocol translation: response failed", "inbound", proto, "target", upProto, "err", err)
+				(&protocol.GatewayError{Status: http.StatusBadGateway, Type: "api_error", Code: "translation_error", Message: "protocol translation of upstream response failed: " + err.Error()}).Write(w, proto)
+				res.status = http.StatusBadGateway
+				return res
+			}
+			body = out
+			w.Header().Set("Content-Type", "application/json")
 		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.WriteHeader(resp.StatusCode)
@@ -408,25 +485,46 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 		return res
 	}
 
-	// Streaming: write through immediately, parse SSE on the side.
+	// Streaming. Pass-through: tee raw bytes to the client immediately and parse SSE on the
+	// side for usage. Translating: parse SSE, re-render each event into the client's protocol,
+	// write that; the raw events still feed the upstream-protocol usage parser.
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
 	fw := &flushWriter{w: w}
 	fbr := &firstByteReader{r: resp.Body}
-	parser := protocol.NewStreamParser(proto)
-	tee := io.TeeReader(fbr, fw)
-	sc := bufio.NewScanner(tee)
+	parser := protocol.NewStreamParser(upProto)
+	var st *translate.Stream
+	var src io.Reader = io.TeeReader(fbr, fw)
+	if tr != nil {
+		st = tr.NewStream()
+		src = fbr
+	}
+	sc := bufio.NewScanner(src)
 	sc.Buffer(make([]byte, 64*1024), 16<<20)
 	var event string
 	var data bytes.Buffer
 	dispatch := func() {
 		if data.Len() > 0 || event != "" {
-			parser.Feed(event, bytes.TrimSuffix(data.Bytes(), []byte("\n")))
+			payload := bytes.TrimSuffix(data.Bytes(), []byte("\n"))
+			parser.Feed(event, payload)
+			if st != nil && res.translateErr == nil {
+				out, err := st.Feed(event, payload)
+				if len(out) > 0 {
+					_, _ = fw.Write(out)
+				}
+				if err != nil {
+					res.translateErr = err
+					h.log.Warn("protocol translation: stream event failed", "inbound", proto, "target", upProto, "event", event, "err", err)
+					if b := st.Fail("protocol translation failed: " + err.Error()); len(b) > 0 {
+						_, _ = fw.Write(b)
+					}
+				}
+			}
 		}
 		event = ""
 		data.Reset()
 	}
-	for sc.Scan() {
+	for sc.Scan() && res.translateErr == nil {
 		line := sc.Bytes()
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		switch {
@@ -439,12 +537,27 @@ func (h *Handler) relay(w http.ResponseWriter, resp *http.Response, proto protoc
 			data.WriteByte('\n')
 		}
 	}
-	dispatch()
+	if res.translateErr == nil {
+		dispatch()
+	}
 	res.clientErr = fw.err
 	if err := sc.Err(); err != nil {
 		res.upstreamErr = err
 		if fw.err == nil {
 			h.log.Warn("upstream stream ended with error", "err", err)
+		}
+	}
+	switch {
+	case res.translateErr != nil:
+		// The upstream body was abandoned mid-way; mark the stream incomplete so it is not billed.
+		res.upstreamErr = res.translateErr
+	case st != nil && !st.Ended() && res.upstreamErr == nil:
+		// Clean upstream EOF but no terminal event was ever decoded: the client-side message is
+		// half-open. Close it with an error instead of leaving the client waiting.
+		res.upstreamErr = errors.New("upstream stream ended before a terminal event")
+		h.log.Warn("protocol translation: upstream stream ended without terminal event", "inbound", proto, "target", upProto)
+		if b := st.Fail("upstream stream ended before completion"); len(b) > 0 {
+			_, _ = fw.Write(b)
 		}
 	}
 	res.ttft = fbr.first.Sub(attemptStart)
@@ -488,12 +601,24 @@ func (f *firstByteReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func copyRequestHeaders(src, dst http.Header) {
+// copyRequestHeaders forwards the allow-listed client headers. When translating, headers that
+// belong to the client's protocol are dropped instead of being sent to a provider that speaks
+// another one (anthropic-beta to an OpenAI endpoint and vice versa). Pass-through behaviour is
+// unchanged: target == inbound, so nothing is filtered.
+func copyRequestHeaders(src, dst http.Header, target protocol.Protocol, translating bool) {
 	for k, vs := range src {
-		if forwardRequestHeaders[strings.ToLower(k)] {
-			for _, v := range vs {
-				dst.Add(k, v)
+		lk := strings.ToLower(k)
+		if !forwardRequestHeaders[lk] {
+			continue
+		}
+		if translating {
+			isAnthropicHdr := strings.HasPrefix(lk, "anthropic-")
+			if isAnthropicHdr && target != protocol.Anthropic || lk == "openai-beta" && target == protocol.Anthropic {
+				continue
 			}
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
 		}
 	}
 }

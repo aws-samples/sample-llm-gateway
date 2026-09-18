@@ -22,6 +22,7 @@
 | `upstream_response_header_timeout` | `5m` | 等上游返回响应头的时间。推理模型首字可能很慢，不宜设置过小。超时同样会切候选 |
 | `max_request_body_bytes` | `33554432`（32 MiB） | 请求体上限，超过返回 413。请求体在 key-auth 之前整体读入内存（鉴权需要 body 里的 model 字段），所以 Pod 内存 limit 至少要容得下「并发上传数 × 这个值」，清单里 1Gi 约对应 30 个满体积并发。没有图片、PDF 这类大附件需求时可以降到 4 到 8 MiB |
 | `max_failover_attempts` | `3` | 一次请求最多尝试的候选供应商数。路由里候选更多也只取前 N 个 |
+| `default_max_tokens` | `8192` | 仅对协议转换路由（候选带 `providerProtocol` 且与入站协议不同）生效：客户端没带 `max_tokens` / `max_output_tokens`、而目标协议是 Anthropic（`max_tokens` 必填）时网关补的值。补了会计入 `llmgw_translation_defaults_total{field="max_tokens"}`。透传路由不碰这个字段。0 或不写等于 8192；不选 4096 是因为 agentic 客户端常输出大段 diff，4096 会以正常的 `stop_reason: max_tokens` 静默截断 |
 | `log_level` | `info` | `debug` / `info` / `warn` / `error` |
 
 ## control_plane

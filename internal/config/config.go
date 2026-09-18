@@ -44,6 +44,11 @@ type Server struct {
 	MaxRequestBodyBytes           int64         `yaml:"max_request_body_bytes"`
 	MaxFailoverAttempts           int           `yaml:"max_failover_attempts"`
 	LogLevel                      string        `yaml:"log_level"`
+	// DefaultMaxTokens is written to the upstream request when a cross-protocol route targets a
+	// provider that requires max_tokens (Anthropic) and the client omitted it. 0 = use the
+	// gateway's built-in default (translate.DefaultMaxTokens, 8192). Pass-through routes never
+	// touch the field.
+	DefaultMaxTokens int64 `yaml:"default_max_tokens"`
 }
 
 type ControlPlane struct {
@@ -166,6 +171,9 @@ func (c *Config) validate() error {
 	}
 	if c.ControlPlane.Token == "" {
 		return fmt.Errorf("control_plane.token is required")
+	}
+	if c.Server.DefaultMaxTokens < 0 {
+		return fmt.Errorf("server.default_max_tokens must be >= 0, got %d", c.Server.DefaultMaxTokens)
 	}
 	// The control-plane token and customer api keys travel on every control-plane call, so
 	// a plaintext base_url would leak them. Require https unless allow_insecure is set.

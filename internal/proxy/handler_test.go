@@ -75,6 +75,7 @@ type fakeUpstream struct {
 	mu       sync.Mutex
 	lastBody map[string]any
 	lastHdr  http.Header
+	lastPath string
 	fail     int  // status to return instead of success, 0 = ok
 	bigBody  int  // when >0, non-stream /messages returns a 200 body of this many bytes
 	negUsage bool // when true, non-stream /messages returns negative token counts (some servers emit -1 for "unknown")
@@ -86,7 +87,7 @@ func (u *fakeUpstream) handler() http.Handler {
 		var m map[string]any
 		_ = json.Unmarshal(body, &m)
 		u.mu.Lock()
-		u.lastBody, u.lastHdr = m, r.Header.Clone()
+		u.lastBody, u.lastHdr, u.lastPath = m, r.Header.Clone(), r.URL.Path
 		fail := u.fail
 		big := u.bigBody
 		neg := u.negUsage
@@ -122,10 +123,15 @@ func (u *fakeUpstream) handler() http.Handler {
 				fl.Flush()
 				time.Sleep(5 * time.Millisecond)
 			}
+		case strings.HasSuffix(r.URL.Path, "/chat/completions") && !stream:
+			// Non-stream chat completion with a tool call (exercises the Anthropic ← Chat codec).
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-x-real","choices":[{"index":0,"message":{"role":"assistant","content":"Running it.","tool_calls":[{"id":"call_9","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":15},"completion_tokens_details":{"reasoning_tokens":2}}}`)
 		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n")
-			_, _ = fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":15},\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":15},\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n")
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		default:
 			w.WriteHeader(404)
@@ -142,6 +148,13 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessCfg(t, nil)
+}
+
+// newHarnessCfg lets a test adjust the config before the handler is built (no data race with
+// the serving goroutines).
+func newHarnessCfg(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 	cp := &fakeCP{}
 	cpSrv := httptest.NewServer(cp.handler())
@@ -161,11 +174,16 @@ func newHarness(t *testing.T) *harness {
 	cfg.Server.MaxFailoverAttempts = 3
 	cfg.ControlPlane.KeyAuthTimeout = time.Second
 	cfg.ControlPlane.TokenHeader = "X-HIGRESS-Token"
+	if mutate != nil {
+		mutate(cfg)
+	}
 	cfg.Providers = map[string]config.ProviderConfig{
 		"primary": {Auth: config.AuthXAPIKey, APIKey: "up-key", Endpoints: map[string]string{
 			config.EndpointAnthropic: upSrv.URL + "/v1", config.EndpointOpenAIChat: upSrv.URL + "/v1"}},
+		// backup also declares a responses endpoint so unsupported-direction tests can reach the
+		// translate.Supported guard; primary deliberately lacks it (see TestMissingKeyAndModelAndUnknownRoute).
 		"backup": {Auth: config.AuthBearer, APIKey: "b-key", Endpoints: map[string]string{
-			config.EndpointAnthropic: up2Srv.URL + "/v1"}},
+			config.EndpointAnthropic: up2Srv.URL + "/v1", config.EndpointOpenAIResponses: up2Srv.URL + "/v1"}},
 	}
 	reg, err := provider.Build(context.Background(), cfg.Providers)
 	if err != nil {
@@ -354,24 +372,25 @@ func TestProviderProtocolSameAsInboundPassesThrough(t *testing.T) {
 	}
 }
 
-// M2: providerProtocol different from inbound is guarded (translation not implemented yet):
-// the candidate is rejected, upstream is not called, and existing routes are unaffected.
-func TestProviderProtocolDifferentRejectedUntilImplemented(t *testing.T) {
+// A direction translate.Supported() does not (yet) cover is guarded: the candidate is skipped,
+// upstream is not called, and the request fails as 502 with the reason in the message.
+// OpenAI Chat ↔ Responses lands in M8; until then it is the canonical "unsupported" pair.
+func TestProviderProtocolUnsupportedDirectionRejected(t *testing.T) {
 	h := newHarness(t)
 	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
-		{ModelCode: "claude-to-gpt", Providers: []controlplane.ProviderRoute{
-			// inbound will be anthropic (/v1/messages); target openai_chat, which "primary" serves.
-			{ProviderCode: "primary", ProviderModelCode: "gpt-x-real",
-				ProviderProtocol: "openai_chat", Priority: 1, Weight: 100},
+		{ModelCode: "chat-to-responses", Providers: []controlplane.ProviderRoute{
+			// inbound openai_chat (/v1/chat/completions); target openai_responses, which "backup" serves.
+			{ProviderCode: "backup", ProviderModelCode: "gpt-x-real",
+				ProviderProtocol: "openai_responses", Priority: 1, Weight: 100},
 		}},
 	}})
-	resp, body := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"claude-to-gpt","max_tokens":5,"messages":[]}`, nil)
-	if resp.StatusCode != 502 {
-		t.Fatalf("cross-protocol route should fail (not implemented), got %d %s", resp.StatusCode, body)
+	resp, body := post(t, h.gw.URL+"/v1/chat/completions", "sk-client", `{"model":"chat-to-responses","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if resp.StatusCode != 502 || !strings.Contains(body, "not supported") {
+		t.Fatalf("unsupported direction should fail with 502, got %d %s", resp.StatusCode, body)
 	}
-	h.up.mu.Lock()
-	called := h.up.lastBody != nil
-	h.up.mu.Unlock()
+	h.up2.mu.Lock()
+	called := h.up2.lastBody != nil
+	h.up2.mu.Unlock()
 	if called {
 		t.Error("upstream must not be called when translation is unsupported")
 	}
