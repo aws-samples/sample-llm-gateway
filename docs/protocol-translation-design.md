@@ -242,6 +242,8 @@ Bedrock **接受**的：`thinking:{type:"disabled"}`、`system` 为 3 个 text b
 8. ✅ **横向铺齐其余 4 向**：Chat↔Responses codec 早已在 M4/M5 写好，补 8 个真实流量 golden 测试一次全过；`Supported()` 全开。真实 Chat 协议流量来源：Codex 0.154 已移除 `wire_api=chat`，Chat Completions 现无主流 CLI agent，改用官方 `openai` Node SDK 7.18 写最小 agentic 循环录制（`testdata/fixtures/openai-sdk-chat/`）。四个方向也全部真实客户端 E2E：Codex→GPT 走 `openai_chat`、Claude Code→GPT 走 `openai_responses`、openai SDK→Claude、openai SDK→GPT 走 `openai_responses`，全 200、计量完整。
 9. ✅ README（Protocol translation 节 + 限制）/ `docs/control-plane.md`（`providerProtocol` 字段、错误重渲染）/ `docs/operations.md`（运维要点、指标、排障表）/ `docs/configuration.md`（`default_max_tokens`）/ `protocol` 包注释；CHANGELOG 草稿放 PR 描述。
 
+执行过程、测试方法、真机踩坑与修法、六方向 E2E 结果表、复现步骤，见 [protocol-translation-report.md](protocol-translation-report.md)。
+
 ### 已知边界（交付时的诚实清单）
 
 - 有损转换：§4 表格之外的 provider 专有字段不跨协议；`n > 1` 只保留第一个 choice；Anthropic 的 `cache_control` 只在 Anthropic↔Anthropic 内保留。

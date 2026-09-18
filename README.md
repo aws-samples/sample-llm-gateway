@@ -356,6 +356,7 @@ This README is in English. Detailed guides, the load-test README, changelog, and
 | [Operations](docs/operations.md) | Adding models and providers, upgrades, metrics, and troubleshooting. |
 | [Private networking](docs/private-networking.md) | EKS, IRSA, VPC endpoints, cross-Region, and cross-account setup. |
 | [Protocol translation design](docs/protocol-translation-design.md) | IR architecture, field mappings for the six directions, decisions, recorded-traffic findings, and test approach. |
+| [Protocol translation report](docs/protocol-translation-report.md) | Implementation timeline, test method, issues found on real traffic and how they were fixed, end-to-end results with Claude Code, Codex, and the OpenAI SDK, and reproduction steps. |
 | [Robustness report](docs/robustness-report.md) | Fault-injection scenarios and test results. |
 | [Load testing](loadtest/README.md) | k6 scripts, Kubernetes Jobs, and test-environment measurements. |
 | [Changelog](CHANGELOG.md) | Version history and upgrade notes. |
