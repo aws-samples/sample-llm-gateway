@@ -167,6 +167,14 @@ IR 架构让全矩阵成本可控：给每个协议写 `to IR` / `from IR`（请
 9. **IR 一期必备字段**（评审补齐）：`ToolChoice`（auto/none/required/named，agentic 客户端会用）；流式事件 `Index`（OpenAI tool_calls delta 的 id 只在首片出现、Anthropic 用 block index，**并行工具调用重组必需**）；
    `ToolInputDelta string`（原样片段、不累积——两家都是片段流）；`ParallelToolCalls`、`ResponseFormat` 作 opaque 携带。`MaxTokens *int64` 与 `Temperature/TopP` 同用指针表示"未设置"。
 
+10. **流式 IR 的工具块不重叠契约**（交付前评审发现的 HIGH 修复后补入，见报告 P18）：解码器必须在发出下一个 `ToolUseStart` 之前先发出前一个工具的 `ToolUseStop`。
+    物理依据：生成是自回归的，一个工具调用的参数 token 生成完才开始下一个，所以三家上游的工具片段都严格按 index 顺序到达（真实并行 fixture `openai-sdk-chat/03` 实证：index 0 的全部片段先于 index 1）；`Index` 只用来让不带 id 的后续片段找到归属，**不意味着会交错**。
+    Chat 解码器原本把所有 `ToolUseStop` 攒到 `finish_reason` 才发，是唯一违反者，已改为新 index 首次出现时先关上一个；对已关闭 index 再来片段按 §7 返回 error。编码器在隐式关块（下一个 start / 消息结束 / 错误）时必须清理自己的 源index→块 映射——这是编码器簿记正确性，不是给解码器兜底。
+
+11. **供应商专属怪癖只对该供应商生效**：`reasoning_effort: "none"`（Bedrock Chat 端点上 GPT-5.x 带工具必需）只在目标 provider 为 Bedrock（`auth: aws_iam` → `Provider.IsBedrock()` → `translate.Options.TargetIsBedrock`）时写入；直连 OpenAI 或第三方兼容端点不加，避免不支持该参数的模型 400。这是 §8b 所述 provider 级 compat 规则的第一条落地。
+
+12. **不透明 round-trip 必须是逐字的**：Responses `reasoning` item 的捕获与三处回放（请求 FromIR、非流式响应 FromIR、流式编码器）都直接使用原始字节（`json.RawMessage`），不经类型化结构或 `map[string]any`——后者会丢未建模字段、打乱键序、把大整数变 float64。
+
 > 第 6 点"改产品定位"在 PR 描述里**知会 Odin**。评审另建议**动手前用一条消息向 Odin 确认"6 向 + reasoning 一期"这个范围**（若他实际只要 2 向，4 向白做）——是否发由负责人决定，不阻塞 M2/M3 的骨架与 fixture 录制。
 
 ## 8b. M3 录制中的真实发现（2026-09-17，官方版 Claude Code 2.1.274 → 透传 → Bedrock us-east-1）

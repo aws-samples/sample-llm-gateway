@@ -11,7 +11,8 @@
 - 验收场景 **Claude Code → GPT** 与 **Codex → Claude** 在 Amazon Bedrock（us-east-1）上用官方客户端多轮工具调用跑通；另外四个方向也全部用真实客户端跑通（其中 Chat 侧客户端为官方 `openai` SDK，原因见 §4.3）。
 - 计量口径与透传一致：始终用上游协议的解析器读原始上游字节，不依赖转换代码。
 - 真机测试暴露了 3 个单元测试栈发现不了的问题（mock 控制面丢字段、客户端可见 usage 与账单拆分不一致、客户端先断连导致 499 误判），全部修复并加回归测试。
-- 单元测试：`translate` 包 45 个、`proxy` 包新增 8 个（六方向 × 流式/非流式 + 错误路径），全部基于真实录制流量；`go test -race ./...` 全绿。
+- 单元测试：`translate` 包 50 个、`proxy` 包新增 8 个（六方向 × 流式/非流式 + 错误路径），全部基于真实录制流量；`go test -race ./...` 全绿。
+- 交付前第三方评审又发现 1 个 HIGH（并行工具调用在 Chat 上游时产生重复的块关闭事件）和 3 个 MEDIUM/LOW，全部修复并用真实并行工具流量复验（§4.3）。
 
 ## 1. 需求与范围
 
@@ -106,7 +107,23 @@ fake 上游同时扮演三种协议（流式与非流式），经完整 handler 
 | P13 | handler 测试断言 Responses 流里有 `event: response.xxx` 行，失败 | 我按 OpenAI 文档写断言；实际 Bedrock/OpenAI 发的是 **data-only 帧**、类型在 `data.type`，Codex 就是这么消费的，编码器忠实于录制流量 | 对照 `codex/01-tool-call.response.sse` | 改断言，编码器不动 |
 | P17 | 给 fake `primary` provider 加 `openai_responses` 端点后，老用例 `TestMissingKeyAndModelAndUnknownRoute` 失败 | 该用例依赖 `primary` 没有 responses 端点来验证 502 | — | 端点挪到 `backup` provider，老用例前提不变 |
 
-### 4.3 未进代码、只记录的
+### 4.3 交付前第三方评审发现（M9 之后）
+
+一位外部评审读完全部代码后指出 5 项，逐条对着代码验证后：4 项属实（其中 1 项 HIGH），1 项部分属实。评审自己也指出了这批问题的共同根源：**E2E 任务全是"读一个文件"这种单工具调用，没测并行工具**。
+
+| # | 现象 | 根因 | 处理 |
+| --- | --- | --- | --- |
+| P18 **HIGH** | Chat 上游并行发两个工具调用时，Anthropic 客户端收到 block 0 **两次** `content_block_stop`；Responses 客户端 `output_item.done` 多发一次、`response.completed.output` 里同一个 function_call **出现两次**。用合成的两工具 Chat 流实跑复现 | Chat 解码器把所有 `ToolUseStop` 攒到 `finish_reason` 才发，IR 里两个工具块重叠；编码器假定块不嵌套，遇到下一个 `ToolUseStart` 用 `closeOpen()` 隐式关掉上一个块但**不删 源index→块 的映射**，迟到的 `ToolUseStop` 又关一次。所有 fixture 都是单工具，测试抓不到 | **源头修**：Chat 解码器在新 index 首次出现时先给上一个工具发 `ToolUseStop`，恢复"IR 工具块不重叠"契约（写进 `ir.go`；物理依据是自回归生成——一个调用的参数 token 生成完才开始下一个，`index` 只用于让不带 id 的后续片段找到归属）；对已关闭 index 再来片段返回 error（§7，不静默劈块）。**编码器簿记修正**：`closeOpen` 关 tool 块时同步删映射（这是编码器自身状态不一致，与解码器无关）。回归：合成流 + 交错拒绝 + **真实并行 fixture**（`openai-sdk-chat/03/04`，GPT-5.6 一轮两个 exec_command；真实流里 index 0 的 10 个片段全部先于 index 1，印证假设） |
+| P19 MEDIUM | 非流式转换失败回 502，但 usage 未清零 → 上报"502 + 真实 token"，与流式失败清零的口径不一致 | `relay` 先 `ParseUsage` 再 `tr.Response()`，失败分支直接 return | 失败分支 `res.usage = Usage{}` |
+| P20 MEDIUM | Responses `reasoning` item 号称"逐字 round-trip"，实际先解进类型化结构再 marshal，OpenAI 新增字段会静默丢；回放侧还经过 `map[string]any`（键序变、大整数变 float64） | 捕获用 `json.Marshal(it)`，回放用 `Unmarshal→map→Marshal` | 捕获：自定义 `UnmarshalJSON` 保留原始字节；回放三处（请求 FromIR、非流式响应 FromIR、流式编码器）直接嵌 `json.RawMessage`。回归断言未建模字段、大整数、键序逐字不变 |
+| P21 | 带工具的 Chat 请求一律加 `reasoning_effort: "none"`——这是 Bedrock GPT-5.x 的怪癖，直连 OpenAI 用不支持该参数的模型会 400 | codec 不知道目标是谁 | `Provider.IsBedrock()`（`auth: aws_iam`）→ `translate.Options.TargetIsBedrock`，只对 Bedrock 目标加；codec 与 proxy 层各有正反断言 |
+| P22 LOW | 采样参数 `frequency_penalty` / `presence_penalty` / `seed` / `logit_bias` / `logprobs` / `top_k` / `n` 跨协议丢失、`is_error` 变 `"Error: "` 前缀、多个 thinking 块在 Chat 非流式只留最后一个——均 by design 但未登记 | — | README 有损清单补 Dropped params 行 |
+| — | 目标侧 FromIR 失败也回 400 不故障转移 | 有意取舍（ToIR 失败是客户端体的问题；多候选混协议时 FromIR 失败理论上应跳候选） | 记录，暂不改；当前部署单候选无影响 |
+| — | 评审称"顺手修了 mock 对 <4 字符 key 的 panic" | 核对 diff：mock 只加了 `providerProtocol` 字段 | 评审记错，未发生 |
+
+修后真实客户端复验（Bedrock，2026-09-18）：Claude Code → GPT 并行读两个文件，客户端侧流 2 个 `tool_use` 块、index 0/1 各恰好一次 `content_block_stop`；Codex → GPT（走 Chat）并行两个 `exec_command`，`output_item.done` = 1 message + 2 function_call 各一次，`completed.output` 三项无重复；两边答案正确、全 200、计量完整。
+
+### 4.4 未进代码、只记录的
 
 - Chat Completions 方向的 E2E 客户端是官方 SDK 而非 CLI agent（P12），这是市场现状不是取舍。
 - Claude Code 对陌生模型名打 `unrecognized_model` 警告、Codex 打 `Model metadata not found` 警告，均不影响运行；生产上 `modelCode` 用真实模型名即可消除。
@@ -122,6 +139,9 @@ fake 上游同时扮演三种协议（流式与非流式），经完整 handler 
 | Codex → Responses | `openai_chat` → `us.openai.gpt-5.6-sol` | 2 | 同上；无需 `-bedrock-compat` |
 | openai SDK → Chat | `anthropic` → `us.anthropic.claude-sonnet-5` | 2 | 全 200，客户端 usage 与账单一致 |
 | openai SDK → Chat | `openai_responses` → `us.openai.gpt-5.6-sol` | 2 | 全 200 |
+| **并行工具** Claude Code → Anthropic | `openai_chat` → `us.openai.gpt-5.6-sol` | 3（一轮内 2 个 Read 并行） | 全 200；客户端流 2 个 tool_use 块各恰好一次 stop（P18 修后） |
+| **并行工具** Codex → Responses | `openai_chat` → `us.openai.gpt-5.6-sol` | 2（一轮内 2 个 exec_command 并行） | 全 200；1 message + 2 function_call 各 done 一次，output 无重复 |
+| **并行工具** openai SDK → Chat（透传，录 fixture） | — → `us.openai.gpt-5.6-sol` | 2 | 真实流 index 0 全部片段先于 index 1，印证不交错假设 |
 
 所有请求 `usage_found: true`、`truncated: ""`。转换路径**不需要**录制阶段的 Bedrock 清洗层：P1/P2 里 Bedrock 会拒的字段要么不进 IR、要么被 codec 处理、要么被请求头过滤挡掉。
 

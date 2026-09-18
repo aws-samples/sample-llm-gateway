@@ -74,7 +74,8 @@ token，改 secret，重启网关，确认日志 `secret resolved` 的 `version_
 - Bedrock 上已验证的组合（2026-09-18，us-east-1）：Claude Code → `us.openai.gpt-5.6-sol`（`openai_chat` 与 `openai_responses` 两条路）、
   Codex → `us.anthropic.claude-sonnet-5`、Codex → GPT 走 `openai_chat`、官方 openai SDK（Chat）→ Claude / → GPT 走 `openai_responses`。
   注意 Bedrock 对透传请求有自己的限制（Chat 端点上 GPT-5.x 带工具必须 `reasoning_effort: "none"`、Responses 端点拒绝 `web_search` 工具类型），
-  这些在转换路径里由网关处理，但透传路径需要客户端自己满足。
+  这些在转换路径里由网关处理，但透传路径需要客户端自己满足。其中 `reasoning_effort: "none"` 只对 `auth: aws_iam` 的 provider（即 Bedrock）写入，
+  直连 OpenAI 或第三方兼容端点的转换请求不带这个字段。
 
 ### 本地验证外接 API 供应商
 
