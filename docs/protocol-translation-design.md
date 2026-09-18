@@ -48,7 +48,7 @@ usage 仍按上游 B 解析（usage 语义已在 Usage 里归一，不受协议�
 | 维度 | OpenAI Chat | OpenAI Responses | Anthropic Messages |
 |---|---|---|---|
 | 系统提示 | `messages[role=system]` | 顶层 `instructions` | **顶层 `system`**（不是 message） |
-| 历史消息 | `messages[]`（role+content） | `input[]`（typed items）或纯字符串 | `messages[]`（role 仅 user/assistant） |
+| 历史消息 | `messages[]`（role: system/user/assistant/tool） | `input[]`（typed items，role 用 `developer` 而非 system）或纯字符串 | `messages[]`（role user/assistant；**`mid-conversation-system` beta 允许 `system` 出现在列表中**，Claude Code 实测在用） |
 | content 形态 | string 或 parts[] | items[]（`input_text`/`input_image`/…） | string 或 blocks[]（`text`/`image`/`tool_use`/`tool_result`） |
 | max tokens | `max_tokens` / `max_completion_tokens`（可选） | `max_output_tokens`（可选） | **`max_tokens`（必填）** |
 | 工具定义 | `tools[{type:function, function:{...}}]` | `tools[{type:function,...}]` | `tools[{name, input_schema}]` |
@@ -168,6 +168,49 @@ IR 架构让全矩阵成本可控：给每个协议写 `to IR` / `from IR`（请
    `ToolInputDelta string`（原样片段、不累积——两家都是片段流）；`ParallelToolCalls`、`ResponseFormat` 作 opaque 携带。`MaxTokens *int64` 与 `Temperature/TopP` 同用指针表示"未设置"。
 
 > 第 6 点"改产品定位"在 PR 描述里**知会 Odin**。评审另建议**动手前用一条消息向 Odin 确认"6 向 + reasoning 一期"这个范围**（若他实际只要 2 向，4 向白做）——是否发由负责人决定，不阻塞 M2/M3 的骨架与 fixture 录制。
+
+## 8b. M3 录制中的真实发现（2026-09-17，官方版 Claude Code 2.1.274 → 透传 → Bedrock us-east-1）
+
+> 真实流量第一次打进来就抓到两处**纯透传下必 400** 的供应商兼容性问题，与协议转换无关，但不解决场景 1 的 E2E 跑不起来。
+
+| # | Claude Code 实际发送 | Bedrock 原生 Anthropic 端点反应 | 逐项剥离实测 |
+|---|---|---|---|
+| 1 | `metadata.user_id` 是一个 **JSON 字符串** `"{\"device_id\":...,\"session_id\":...}"` | 400 `Request metadata contains a value that violates the regular expression` | 换成纯 hex / uuid / 含 `_ . @ 空格` / 空串 都接受（限制只针对 `{ " :` 这类字符） |
+| 2 | `output_config: {effort:"high", format:{type:"json_schema", schema:...}}`（Anthropic 结构化输出 beta，Claude Code 内部"给会话起名"请求） | 400 `output_config.format: Extra inputs are not permitted` | 删掉即 200 |
+
+Bedrock **接受**的：`thinking:{type:"disabled"}`、`system` 为 3 个 text block 的数组、`?beta=true` query、8 个 `anthropic-beta` 特性头、`max_tokens: 64000`、`stream: true`。
+
+**定性**：这是"Bedrock 供应商适配"问题，不是网关转换逻辑问题。今天任何客户用 Claude Code 直连本网关打 Bedrock Claude 都会 100% 失败。
+**处理方向（单独一项，不混进协议转换核心）**：provider 级 `compat` 规则——
+- `user_id` 规范化：含非法字符时 **hash 成合法 token**（保留可追溯性，不丢字段）；
+- 目标供应商不支持的 beta 字段（`output_config.format` 等）**剥离 + 记 `llmgw_compat_stripped_total{provider,field}`**（按 §7"能用别报错"）；
+- 规则表按 provider 配置，Bedrock 默认开、直连 Anthropic 官方 API 默认关。
+需要它的正当理由：与 §7 原则一致，且 LiteLLM 等网关对 Bedrock 也做同类 field 适配。
+
+| 3 | 请求头 `anthropic-beta` 含 `prompt-caching-scope-2026-01-05` | 400 `Unexpected value(s) ... for the anthropic-beta header` | 8 个 beta 值逐个单测，**只有这一个**被拒，其余 7 个（claude-code、interleaved-thinking、thinking-token-count、context-management、mid-conversation-system、effort、structured-outputs）全接受 |
+
+其余录制特征（作 fixture 参考）：请求头 `Anthropic-Beta` 列表、`X-Stainless-*`、`User-Agent: claude-cli/2.1.274`；请求体顶层键 `max_tokens, messages, metadata, model, output_config, stream, system, thinking, tools`。
+
+### 场景 1 fixture 里的关键事实（`testdata/fixtures/claude-code/`，3 轮 = 一个完整 agentic 循环）
+- `02-tool-use-call`：22 个工具定义；响应 = `thinking` 块 → `tool_use(Read)` → `stop_reason: tool_use`。
+- `03-tool-result-followup`：assistant 消息里 **`thinking` + `tool_use` 原样回传**，紧跟 user 的 `tool_result` —— **reasoning round-trip 一期必做被实锤**。
+- `thinking: {type:"adaptive", display:"omitted"}` —— 新的 adaptive 形态，IR 需 opaque 携带。
+- **`role: system` 出现在 `messages[]` 内部**（`mid-conversation-system-2026-04-07` beta）—— **§3 对照表"Anthropic messages role 仅 user/assistant"是错的**，已修正；IR `RoleSystem` 允许出现在 Messages 列表中，FromIR 到不支持中途 system 的协议时降级为 user 消息前缀。
+- usage 含 `cache_creation_input_tokens: 38813` / `cache_read_input_tokens` / `output_tokens_details.thinking_tokens` —— 归一时保留 cache 字段。
+- 客户端自己发 `max_tokens: 64000`，`DefaultMaxTokens` 只在缺省时触发。
+
+### 场景 2 fixture 里的关键事实（`testdata/fixtures/codex/`，Codex 0.154.0，2 轮工具调用往返）
+- **`store: false`、`previous_response_id: null`，每轮带全量 `input` 历史** —— **评审提出的"Responses 有状态性会卡死场景 2"被证伪**，IR 无状态设计成立。
+- `include: ["reasoning.encrypted_content"]`、`reasoning: {summary:"auto"}`（开 effort 后为 `{effort:"medium", summary:"auto"}`）。
+- **`max_output_tokens` 缺省** —— 转 Anthropic 时 `DefaultMaxTokens` 必触发。
+- `input[0].role = "developer"`（不是 system）；`tools` 含 `function` ×7、`namespace` ×1（嵌套 function 列表）、`web_search` ×1；`tool_choice: "auto"`、`parallel_tool_calls: true`。
+- 响应 `01`：`output_item.added` = `message` + `function_call`，参数走 38 个 `function_call_arguments.delta` 增量片段（**流式 Index 必需**的实证）。
+- 请求 `02`：回传 `message/assistant(output_text)` + `function_call` + `function_call_output`（`call_id` 对齐）。
+- **Bedrock 拒绝 `web_search` 工具类型**（400 `web search is not supported`）；`namespace`、`include`、`reasoning`、`client_metadata`、`prompt_cache_key` 均接受 → 又一条 Bedrock compat 规则：剥离 OpenAI-hosted 工具类型。
+- **Bedrock 的 Responses 端点（gpt-5.6-sol）即使 `reasoning.effort=medium` 也不返回 `reasoning` item / `encrypted_content`**。Responses→IR 的 reasoning 解析按 OpenAI 官方规范实现；真实 round-trip 验证靠场景 1 的 thinking fixture 与 M7 的 Codex→Claude E2E。
+
+### 录制工具
+`tools/recordproxy`（开发工具，不进镜像）：透传录制请求头/体与完整 SSE；`-bedrock-compat` 开关只在**转发时**应用上述 compat 规则，**录下的请求体始终是客户端原样**。修过一个真实坑：agentic 客户端收到终止事件即断连，`httputil.ReverseProxy` 以 `panic(http.ErrAbortHandler)` 中止 handler，落盘要放 `defer` 里。
 
 ## 9. 测试方案
 

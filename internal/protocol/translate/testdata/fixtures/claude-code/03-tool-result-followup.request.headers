@@ -1,0 +1,21 @@
+POST /v1/messages?beta=true
+Content-Type: application/json
+X-Stainless-Lang: js
+X-Stainless-Os: MacOS
+Connection: keep-alive
+Content-Length: 113136
+X-Claude-Code-Session-Id: af0eac67-3022-4bfd-a721-e3ace5068a52
+Anthropic-Beta: claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24
+Anthropic-Dangerous-Direct-Browser-Access: true
+Accept-Encoding: gzip, deflate, br, zstd
+Accept: application/json
+User-Agent: claude-cli/2.1.274 (external, sdk-cli)
+X-Stainless-Package-Version: 0.112.1
+X-Stainless-Retry-Count: 0
+X-Stainless-Runtime: node
+X-Api-Key: <redacted>
+X-Stainless-Arch: arm64
+X-Stainless-Runtime-Version: v26.3.0
+X-Stainless-Timeout: 600
+Anthropic-Version: 2023-06-01
+X-App: cli
