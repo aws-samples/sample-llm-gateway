@@ -76,7 +76,7 @@ fake 上游同时扮演三种协议（流式与非流式），经完整 handler 
 
 - Claude Code：`/opt/homebrew/bin/claude -p ... --allowedTools Read`，`ANTHROPIC_BASE_URL=http://127.0.0.1:8081`、`ANTHROPIC_MODEL=<modelCode>`，独立 `CLAUDE_CONFIG_DIR`。
 - Codex：`codex exec --skip-git-repo-check ...`，`CODEX_HOME` 指向一份 `model_provider` 为网关、`wire_api = "responses"` 的 config.toml。
-- openai SDK：`/tmp/llmgw/chat-agent/agent.mjs`（不进仓库）——流式 + 一个 `exec_command` 工具 + 结果回传直到模型给出答案。
+- openai SDK：本地一个约 50 行的官方 `openai` Node SDK 脚本（不进仓库）——`chat.completions.create` 流式 + `stream_options.include_usage` + 一个 `exec_command` 工具，循环把 `tool_calls` 结果以 `role: tool` 回传直到模型给出答案。
 
 任务统一为"用工具读一个文件并说出行数"，能一次覆盖：首问 → 模型发工具调用 → 客户端回传结果 → 模型作答，即一个完整 agentic 循环。
 
