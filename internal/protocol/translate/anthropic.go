@@ -128,7 +128,7 @@ func (anthropicRequest) ToIR(body []byte) (*Request, error) {
 	if w.ToolChoice != nil {
 		switch w.ToolChoice.Type {
 		case "", "auto":
-			r.ToolChoice = ToolChoice{Mode: ToolChoiceAuto}
+			// auto == wire default; normalise to the IR zero value so every FromIR omits it.
 		case "any":
 			r.ToolChoice = ToolChoice{Mode: ToolChoiceRequired}
 		case "none":
@@ -251,14 +251,24 @@ func (anthropicRequest) FromIR(r *Request, providerModel string, opts Options) (
 	default:
 		return nil, errors.New("anthropic request: max_tokens is required and no default is configured")
 	}
-	if len(r.System) > 0 {
-		blocks, err := irContentToAnthropic(r.System, true)
+	// Top-level system = IR System plus any LEADING system-role messages (e.g. a Responses
+	// `developer` item at the head of `input`, which Codex sends alongside `instructions`).
+	// System messages appearing after the first non-system turn stay in place as
+	// mid-conversation system messages (beta), which Claude Code itself relies on.
+	system := append([]Content(nil), r.System...)
+	msgs := r.Messages
+	for len(msgs) > 0 && msgs[0].Role == RoleSystem {
+		system = append(system, msgs[0].Content...)
+		msgs = msgs[1:]
+	}
+	if len(system) > 0 {
+		blocks, err := irContentToAnthropic(system, true)
 		if err != nil {
 			return nil, err
 		}
 		w.System, _ = json.Marshal(blocks)
 	}
-	for i, m := range r.Messages {
+	for i, m := range msgs {
 		var role string
 		switch m.Role {
 		case RoleUser:

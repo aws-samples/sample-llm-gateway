@@ -381,7 +381,7 @@ func (openAIChatRequest) ToIR(body []byte) (*Request, error) {
 			_ = json.Unmarshal(w.ToolChoice, &s)
 			switch s {
 			case "auto":
-				r.ToolChoice = ToolChoice{Mode: ToolChoiceAuto}
+				// wire default → IR zero value (see ToolChoice doc)
 			case "none":
 				r.ToolChoice = ToolChoice{Mode: ToolChoiceNone}
 			case "required":

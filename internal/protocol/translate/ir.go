@@ -102,6 +102,10 @@ const (
 )
 
 // ToolChoice constrains tool calling. Zero value = unset (= auto on the wire).
+//
+// Invariant: ToIR normalises an explicit wire "auto" to the zero value and FromIR omits
+// tool_choice for both "" and ToolChoiceAuto. Omitting is the safe encoding everywhere
+// (Anthropic rejects tool_choice without tools) and keeps the IR round-trip stable.
 type ToolChoice struct {
 	Mode ToolChoiceMode
 	Name string // ToolChoiceNamed
