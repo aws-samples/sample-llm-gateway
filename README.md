@@ -39,7 +39,7 @@ Clients
                                            - Usage reporting
 ```
 
-The gateway preserves the incoming protocol: Chat Completions requests go to a Chat Completions endpoint, Responses requests to a Responses endpoint, and Messages requests to a Messages endpoint. It does not translate between these APIs or call the Amazon Bedrock Converse API.
+By default the gateway preserves the incoming protocol: Chat Completions requests go to a Chat Completions endpoint, Responses requests to a Responses endpoint, and Messages requests to a Messages endpoint. A route candidate can optionally declare `providerProtocol` to translate between these three APIs, so an Anthropic Messages client (such as Claude Code) can be served by a model behind a Chat Completions endpoint, or a Responses client (such as Codex) by a model behind a Messages endpoint. All six directions are supported; see [Protocol translation](#protocol-translation). The gateway does not call the Amazon Bedrock Converse API.
 
 The gateway provides:
 
@@ -207,6 +207,40 @@ Protocol preservation does not mean byte-for-byte forwarding of the entire HTTP 
 
 Other request fields are retained without protocol conversion, although JSON serialization can change whitespace and field ordering. Response bodies are relayed without format conversion, subject to size and error handling limits. Clients must supply parameters supported by the model; the gateway does not rename fields such as `max_tokens` to `max_completion_tokens`.
 
+### Protocol translation
+
+A route candidate can set `providerProtocol` to `openai_chat`, `openai_responses`, or `anthropic`. When it differs from the protocol of the inbound request, the gateway converts the request into the provider's protocol, and converts the non-streaming response or the SSE stream back into the client's protocol. Omitting `providerProtocol` keeps the pass-through behavior described above; pass-through routes are not affected by this feature.
+
+```json
+{
+  "modelCode": "claude-sonnet-5",
+  "providers": [
+    {
+      "providerCode": "bedrock",
+      "providerModelCode": "us.openai.gpt-5.6-sol",
+      "providerProtocol": "openai_chat",
+      "priority": 10,
+      "weight": 100
+    }
+  ]
+}
+```
+
+With this route, a Claude Code session pointed at `/v1/messages` with `ANTHROPIC_MODEL=claude-sonnet-5` is served by GPT through the Chat Completions endpoint.
+
+| Aspect | Behavior |
+| --- | --- |
+| Scope | Text, system/developer instructions, tool definitions, `tool_choice`, tool calls and tool results (including parallel calls in streams), images in user messages, `max_tokens`/`max_completion_tokens`/`max_output_tokens`, `temperature`, `top_p`, stop sequences, streaming, and `response_format`/`text.format` between the two OpenAI protocols. Usage and stop/finish reasons are mapped in both directions. |
+| Reasoning | Opaque round-trip only: Anthropic `thinking` blocks with a signature and Responses `reasoning` items with `encrypted_content` are replayed to the same provider family and never leaked to the other one. Unsigned thinking text is dropped when replayed to Anthropic and surfaced as `reasoning_content` on Chat Completions. |
+| `max_tokens` | Anthropic requires it. When a Chat or Responses client omits it, the gateway writes `server.default_max_tokens` (default 8192) and increments `llmgw_translation_defaults_total{field="max_tokens"}`. |
+| Provider quirks | Chat Completions requests with tools carry `reasoning_effort: "none"` (Bedrock rejects function tools otherwise for GPT-5.x); hosted Responses tools such as `web_search` have no cross-provider meaning and are dropped. |
+| Stateful Responses | The gateway is stateless. `previous_response_id` is rejected with HTTP 400; clients must send `store: false` and the full history (Codex does). |
+| Errors | Upstream error bodies are re-rendered in the client's protocol with the upstream status preserved. If a streamed response cannot be translated mid-way, the client receives an error event in its own protocol and the request is metered as an interrupted transfer. |
+| Headers | `anthropic-*` headers are not forwarded to OpenAI-protocol providers and `openai-beta` is not forwarded to Anthropic-protocol providers. |
+| Metering | Usage is parsed from the raw upstream bytes with the provider protocol's parser, exactly as for a pass-through request of that protocol. |
+
+The codecs are covered by golden tests built from recorded Claude Code, Codex, and OpenAI SDK traffic, and every direction has been exercised end to end against Amazon Bedrock with those clients. Translation is still lossy by nature: provider-specific fields outside the list above are not carried across, and the model behind the route must support the requested capabilities (for example tool calling). See [docs/protocol-translation-design.md](docs/protocol-translation-design.md) for the mapping tables and decisions.
+
 Before committing to a response, the gateway can try another candidate on local credential/signing errors, transport errors, or HTTP 429/5xx responses. Attempts are bounded by `max_failover_attempts` (default: 3) and the overall request timeout. Other upstream HTTP errors, including 401 and 403, are passed through. The last candidate's HTTP 429/5xx response can also be passed through; failures without a committed upstream response generally produce HTTP 502 or 504. There is no failover after response relay begins.
 
 ## Deployment on Amazon EKS
@@ -280,6 +314,7 @@ The script sends real inference requests, tests streaming and non-streaming beha
 ## Known limitations
 
 - Only the three inference APIs listed above are implemented. This is not a full OpenAI or Anthropic API replacement, and it does not translate to Converse or other protocols.
+- Protocol translation is lossy by design: only the fields listed under [Protocol translation](#protocol-translation) cross protocols, reasoning is round-tripped opaquely rather than converted, stateful Responses (`previous_response_id`) are rejected, and `n > 1` keeps only the first choice. Behavior with provider-specific extensions is not guaranteed.
 - Authorization is a synchronous control-plane dependency. If `key-auth` is unavailable, inference requests fail closed with HTTP 503.
 - Usage reporting is not a durable billing ledger. Records can be lost on a crash, queue overflow, exhausted retries, or an unsuccessful shutdown flush. Reconcile independently with provider usage.
 - After response relay begins, the gateway does not retry or inject its own SSE error events. Clients should check completion markers such as `message_stop`, `[DONE]`, or `response.completed` to detect incomplete streams.
@@ -320,6 +355,7 @@ This README is in English. Detailed guides, the load-test README, changelog, and
 | [Control plane contract](docs/control-plane.md) | Routes, authorization, usage reporting, and error mappings. |
 | [Operations](docs/operations.md) | Adding models and providers, upgrades, metrics, and troubleshooting. |
 | [Private networking](docs/private-networking.md) | EKS, IRSA, VPC endpoints, cross-Region, and cross-account setup. |
+| [Protocol translation design](docs/protocol-translation-design.md) | IR architecture, field mappings for the six directions, decisions, recorded-traffic findings, and test approach. |
 | [Robustness report](docs/robustness-report.md) | Fault-injection scenarios and test results. |
 | [Load testing](loadtest/README.md) | k6 scripts, Kubernetes Jobs, and test-environment measurements. |
 | [Changelog](CHANGELOG.md) | Version history and upgrade notes. |
@@ -335,13 +371,15 @@ internal/router/        Route snapshots, polling, and candidate selection
 internal/provider/      Provider registry and authentication
 internal/secrets/       AWS Secrets Manager resolution
 internal/protocol/      Request handling, errors, and usage parsing
-internal/proxy/         Inference forwarding, failover, and response relay
+internal/protocol/translate/  Cross-protocol translation (IR, per-protocol codecs, stream state machines)
+internal/proxy/         Inference forwarding, failover, translation, and response relay
 internal/metering/      In-memory usage queue and retries
 internal/observability/ JSON logging and Prometheus metrics
 configs/                Example gateway configurations and routes
 deploy/                 Container, EKS, IAM, and Kubernetes examples
 docs/                   Detailed guides
 scripts/                Live smoke test
+tools/recordproxy/      Development proxy that records client traffic as translation fixtures
 loadtest/               k6 scripts, Jobs, and results
 ```
 

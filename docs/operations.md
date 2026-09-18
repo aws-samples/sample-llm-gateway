@@ -60,7 +60,21 @@ token，改 secret，重启网关，确认日志 `secret resolved` 的 `version_
   在 `internal/proxy` 加路径映射。同一协议但 usage 字段缺失或改名的厂商也归这类，表现是计量 token 为 0，
   修法是在对应协议的 usage 解析里加兼容分支，改动小得多。
 
-协议转换（客户端用 Anthropic 格式调 OpenAI 模型）不在上面两种里，它是第二阶段的范围，第一阶段明确不做。
+协议转换（客户端用 Anthropic 格式调 OpenAI 模型，或反过来）**不需要改代码**：在路由候选上加 `providerProtocol` 即可
+（见 control-plane.md 的路由字段说明）。三种协议两两之间六个方向都支持。只有在新增第四种协议时才要动代码：
+在 `internal/protocol/translate` 为它实现请求 / 响应 / 流式三对 codec 并注册到 `translate.go` 的查找表。
+
+### 协议转换路由的运维要点
+
+- 路由候选带 `providerProtocol` 且与入站协议不同的请求会走转换。透传路由（不带该字段）完全不受影响，代码路径不同。
+- 客户端没给 `max_tokens` 而目标是 Anthropic 时，网关补 `server.default_max_tokens`（默认 8192）并计入
+  `llmgw_translation_defaults_total{field="max_tokens"}`。这个指标持续增长而用户反馈回答被截断（`stop_reason: max_tokens`）时，调大该配置。
+- 上游返回的错误按客户端协议重新渲染、状态码不变；日志里 `upstream_status` 仍是上游原始状态码。
+- 转换路径的计量用**上游协议**的解析器读原始上游字节，与该协议透传时的账完全一致，不依赖转换代码。
+- Bedrock 上已验证的组合（2026-09-18，us-east-1）：Claude Code → `us.openai.gpt-5.6-sol`（`openai_chat` 与 `openai_responses` 两条路）、
+  Codex → `us.anthropic.claude-sonnet-5`、Codex → GPT 走 `openai_chat`、官方 openai SDK（Chat）→ Claude / → GPT 走 `openai_responses`。
+  注意 Bedrock 对透传请求有自己的限制（Chat 端点上 GPT-5.x 带工具必须 `reasoning_effort: "none"`、Responses 端点拒绝 `web_search` 工具类型），
+  这些在转换路径里由网关处理，但透传路径需要客户端自己满足。
 
 ### 本地验证外接 API 供应商
 
@@ -141,6 +155,8 @@ CLAUDE_MODELS="" RESPONSES_MODELS="" GPT_MODELS="kimi" GW=http://localhost:8080 
 | `llmgw_metering_queue_depth` | gauge | | 待上报记录数。持续接近 `queue_size` 说明控制面上报接口跟不上 |
 | `llmgw_routes_models` | gauge | | 当前路由快照里的模型数。骤降说明控制面下发的路由表少了模型 |
 | `llmgw_routes_rejected_total` | counter | | 被网关拒收的路由快照数。控制面返回 200 但模型列表为空、而网关手里已有非空快照时拒收并沿用旧表，防止控制面故障把全部路由清空。持续增长说明控制面 model-routes 接口有问题 |
+| `llmgw_translations_total` | counter | `inbound` `target` `result` | 协议转换请求数，按入站协议、目标协议和结果。`result` ∈ ok / request_error（客户端请求体无法转换，返 400）/ response_error（上游非流式响应无法转换，返 502）/ stream_error（流中途转换失败，客户端收到 error 事件，计量按中断处理）。后三者非零说明某个 codec 遇到了没见过的形状，日志 `protocol translation:` 前缀带具体原因 |
+| `llmgw_translation_defaults_total` | counter | `field` | 转换时网关替客户端补的字段次数，目前只有 `max_tokens`。用于把「回答被截断」和「网关默认值」关联起来 |
 
 建议告警：
 
@@ -199,7 +215,11 @@ stdout，一行一条 JSON。级别由 `server.log_level` 控制。
 | 所有请求 503 `authorization service unavailable` | 控制面 key-auth 不可达、超时、返回非 `00000`、token 错 | `llmgw_keyauth_errors_total` 增长；日志 `key-auth unavailable` 带 err | 检查控制面健康、网络策略、`control_plane.token`；必要时放宽 `key_auth_timeout` |
 | 某模型 404 `model "x" has no active route` | 控制面路由里没有这个 modelCode，或该模型 `providers` 为空 | `/v1/models` 看不到该模型；`llmgw_routes_models` | 在控制面补路由；看 `routes poll failed` 日志确认网关拿到了最新路由 |
 | 某模型 502 `all upstream attempts failed: provider "x" not configured` | 路由引用了配置里没有的 providerCode | 日志 `route references unconfigured provider` | 网关配置加 provider 并重启，或改路由 |
-| 某模型 502 `... does not serve openai_responses` | 路由把该模型配给了不支持这个协议的供应商 | 日志 `provider lacks endpoint for protocol` | 给 provider 补 endpoint，或路由换供应商 |
+| 某模型 502 `... does not serve openai_responses` | 路由把该模型配给了不支持这个协议的供应商 | 日志 `provider lacks endpoint for protocol` | 给 provider 补 endpoint，或路由换供应商。带 `providerProtocol` 的候选按该字段查 endpoint，不按入站协议 |
+| 某模型 502 `... has unknown providerProtocol "x"` | 路由候选的 `providerProtocol` 拼错 | 日志 `route has unknown providerProtocol` | 改为 `openai_chat` / `openai_responses` / `anthropic` 之一 |
+| 转换路由 400 `protocol translation: ...` | 客户端请求体含无法跨协议表达的字段，最常见是 Responses 的 `previous_response_id`（网关无状态） | `llmgw_translations_total{result="request_error"}`；日志 `protocol translation: request rejected` | 客户端改为 `store: false` 并自带完整历史（Codex 默认如此） |
+| 转换路由 502 `protocol translation of upstream response failed` | 上游返回了 codec 没见过的响应形状 | `llmgw_translations_total{result="response_error"}`；日志带上游片段 | 反馈给维护者补 codec；临时可把该候选的 `providerProtocol` 去掉换回透传（如果客户端协议与供应商一致） |
+| 转换路由的回答被截断、`stop_reason: max_tokens` | 客户端没带 max_tokens，网关补的默认值不够 | `llmgw_translation_defaults_total{field="max_tokens"}` 有增长 | 调大 `server.default_max_tokens`，或让客户端显式传 |
 | 502 `... upstream status 5xx` / 504 | 所有候选都在首包前失败 | `llmgw_upstream_failovers_total` 按 provider 看；日志有上游 body 片段 | 供应商侧问题；考虑加备用候选 |
 | 502 `upstream response body exceeds gateway limit` | 非流式响应体超过 64 MiB 上限，网关拒绝转发截断内容 | 日志 `upstream response body too large, rejecting` 带 `limit_bytes`/`upstream_status`；计量记 502、token 0 | 该响应确实过大；需要大响应时改用流式，或评估上限 |
 | Bedrock 返回 401/403 `not authorized to perform: bedrock:InvokeModel on resource: ...project/default` | Responses API 需要 `project/default` 资源权限，IAM 策略未授予 | 只有 `/v1/responses` 失败，messages / chat 正常 | IAM 策略加 `arn:aws:bedrock:*:*:project/default`；跨账号时是对端角色的策略 |

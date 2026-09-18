@@ -230,10 +230,21 @@ Bedrock **接受**的：`thinking:{type:"disabled"}`、`system` 为 3 个 text b
 
 1. ✅ 设计定稿（本文档，§8 已决策；评审后修正 reasoning/状态/字段/默认值/顺序）。
 2. ✅ 骨架 + 分叉点 + 零回归：`providerProtocol` 路由字段透传到 `Candidate`；`translate` 子包 IR 类型 + codec 接口 + `Supported()`；handler 按 `Supported()` 决定跳过候选；4 个测试守护（透传不变、跨协议未支持时拒且不调上游、非法值拒）。
-3. **录制真实 fixture**（透传模式跑 Claude Code→Claude、Codex→GPT），同时证伪 Codex 有状态性（§8.7）。落 `testdata/fixtures/`。
-4. **方向 1：Anthropic ↔ OpenAI Chat**（Claude Code→GPT）：Anthropic 请求 to IR、Chat 请求 from IR；Chat 响应 to IR、Anthropic 响应 from IR；流式状态机；golden 单测（用 fixture）。
-5. **方向 2：Responses ↔ Anthropic**（Codex→Claude）：同上。
-6. handler relay 接线：`Supported(proto,target)` 为真时走 IR 转换（parser 按 **targetProto** 建、FromIR 注入 include_usage），否则透传；打开 `Supported()` 对应方向。
-7. **E2E 验收（必过）**：Claude Code→GPT、Codex→Claude，真实 Bedrock 端点（Claude 用干净别名），含多轮工具调用 + reasoning round-trip + 计量核对。
-8. **横向铺齐其余 4 向**（Chat→Anthropic、Anthropic→Responses、Chat↔Responses 两向）：补各协议缺的 to/from IR，6 向 golden 单测全绿，`Supported()` 全开。
-9. README/`protocol` 包注释/文档更新（去掉"不做协议转换"，写清 6 向支持矩阵与有损边界）+ CHANGELOG 草稿放 PR 描述。
+3. ✅ **录制真实 fixture**（透传模式跑 Claude Code→Claude、Codex→GPT），证伪了 Codex 有状态性（发 `store:false` + 全量历史，§8.7）。落 `testdata/fixtures/{claude-code,codex}/` + `tools/recordproxy`。
+4. ✅ **方向 1：Anthropic ↔ OpenAI Chat**：请求/非流式响应 codec（11 测）+ 流式状态机（6 测），全部真实 fixture 驱动。
+5. ✅ **方向 2：Responses ↔ Anthropic**：同上。决策补充：`instructions`→IR System，`developer` item 留 Messages（RoleSystem）；Anthropic FromIR 把开头连续 RoleSystem 提升为顶层 `system`；`tool_choice` 显式 `auto` 归一为零值（三家省略 == auto，Anthropic 无 tools 带 tool_choice 会报错）。
+6. ✅ **handler 接线**：`translate.Translator` 门面（Request / Response / Error / NewStream）；计量始终用**上游协议**解析原始上游字节，与该协议透传一致、不依赖 codec；上游错误按客户端协议重渲染、状态码不变；流中途转换失败或上游没发终止事件时补客户端协议的 error 事件并按中断计量。新增 `server.default_max_tokens`、`llmgw_translations_total{inbound,target,result}`、`llmgw_translation_defaults_total{field}`。
+7. ✅ **E2E 验收**（真 Bedrock us-east-1，2026-09-18）：Claude Code → `us.openai.gpt-5.6-sol`（三轮：首问→Read 工具→结果→回答）、Codex → `us.anthropic.claude-sonnet-5`（两轮 exec_command）均正确完成、全 200、计量有 usage。实测修了三处测试栈发现不了的问题：
+   - mock 控制面 `providerRoute` 缺 `providerProtocol` 字段，反序列化即丢；
+   - Chat 流解码器把 usage 解进类型化结构再序列化，丢了 Bedrock 非标 `prompt_tokens_details.cache_write_tokens`，客户端看到的拆分与账单不一致（input 14331/cw 0 vs input 2/cw 14329）→ usage 保持 RawMessage 走 `protocol.ParseUsage`；
+   - Codex 收到 `response.completed` 立即断连，网关仍在等 Bedrock Anthropic 流 EOF，ctx 取消→误判 client_disconnect 499 不计费 → 转换流写出终止事件后立即停止读上游（透传路径实测无此现象，未改）。
+   - 转换路径**不需要** recordproxy 的 `-bedrock-compat` 清洗：§8b 里 Bedrock 会拒的 `metadata.user_id`/`output_config`/beta 头/`web_search`/`reasoning_effort` 要么不进 IR、要么被 codec 处理。
+8. ✅ **横向铺齐其余 4 向**：Chat↔Responses codec 早已在 M4/M5 写好，补 8 个真实流量 golden 测试一次全过；`Supported()` 全开。真实 Chat 协议流量来源：Codex 0.154 已移除 `wire_api=chat`，Chat Completions 现无主流 CLI agent，改用官方 `openai` Node SDK 7.18 写最小 agentic 循环录制（`testdata/fixtures/openai-sdk-chat/`）。四个方向也全部真实客户端 E2E：Codex→GPT 走 `openai_chat`、Claude Code→GPT 走 `openai_responses`、openai SDK→Claude、openai SDK→GPT 走 `openai_responses`，全 200、计量完整。
+9. ✅ README（Protocol translation 节 + 限制）/ `docs/control-plane.md`（`providerProtocol` 字段、错误重渲染）/ `docs/operations.md`（运维要点、指标、排障表）/ `docs/configuration.md`（`default_max_tokens`）/ `protocol` 包注释；CHANGELOG 草稿放 PR 描述。
+
+### 已知边界（交付时的诚实清单）
+
+- 有损转换：§4 表格之外的 provider 专有字段不跨协议；`n > 1` 只保留第一个 choice；Anthropic 的 `cache_control` 只在 Anthropic↔Anthropic 内保留。
+- reasoning 只做不透明 round-trip，不做跨家族转换（§8.4）。Bedrock 的 Responses 端点当前不返回 reasoning item，所以 Codex→Claude→Codex 一路上 Claude 的 thinking 不会以 Codex 能识别的形式出现（Claude 的 thinking 带签名，不能泄给 OpenAI 侧）。
+- 有状态 Responses（`previous_response_id`）返 400。
+- 透传路径与 Bedrock 的兼容性问题（§8b）不在本 feature 范围内，仍需客户端自己满足（`reasoning_effort:"none"`、不发 `web_search` 等）。

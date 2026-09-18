@@ -1,6 +1,7 @@
 // Package proxy implements the request pipeline:
-// detect protocol -> extract key/model -> key-auth -> route -> rewrite -> forward
-// -> relay (tee usage) -> async metering.
+// detect protocol -> extract key/model -> key-auth -> route -> rewrite (or translate when the
+// candidate's providerProtocol differs) -> forward -> relay (tee usage; re-render when
+// translating) -> async metering.
 package proxy
 
 import (

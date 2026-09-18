@@ -1,6 +1,9 @@
 // Package protocol contains the minimal body handling for each supported wire
 // protocol: extracting/rewriting the model, making sure usage is emitted, and
-// parsing usage out of streaming and non-streaming responses. No format conversion.
+// parsing usage out of streaming and non-streaming responses. This package does no
+// format conversion; cross-protocol translation lives in the translate sub-package and
+// is only used for route candidates that declare a providerProtocol different from
+// the inbound protocol.
 package protocol
 
 import (
