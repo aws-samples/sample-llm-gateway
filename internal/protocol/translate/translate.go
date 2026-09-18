@@ -17,13 +17,18 @@ type ResponseCodec interface {
 	FromIR(*Response) ([]byte, error)
 }
 
-// StreamCodec converts a protocol's SSE event stream to and from the canonical event stream.
-//
-// ToIR is fed one source SSE event at a time (event name may be empty) and returns zero or more
-// canonical events. FromIR renders one canonical event into zero or more target SSE event byte
-// chunks (already framed as "event: ...\ndata: ...\n\n" where the target uses named events).
-type StreamCodec interface {
+// StreamDecoder turns one source protocol's SSE events into canonical events. It is stateful
+// (tracks open blocks / tool calls across events), so a fresh instance is created per response.
+// ToIR is fed one SSE event at a time (event name may be empty) and returns zero or more
+// canonical events.
+type StreamDecoder interface {
 	ToIR(event string, data []byte) ([]StreamEvent, error)
+}
+
+// StreamEncoder renders canonical events into the target protocol's SSE bytes (already framed:
+// "event: ...\ndata: ...\n\n" for named-event protocols, "data: ...\n\n" for OpenAI). Stateful;
+// one instance per response.
+type StreamEncoder interface {
 	FromIR(StreamEvent) ([]byte, error)
 }
 

@@ -36,6 +36,7 @@ type chatReq struct {
 	Stream              bool            `json:"stream,omitempty"`
 	StreamOptions       *chatStreamOpts `json:"stream_options,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
 }
 
 type chatStreamOpts struct {
@@ -120,6 +121,13 @@ func (openAIChatRequest) FromIR(r *Request, providerModel string, _ Options) ([]
 			params = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
 		w.Tools = append(w.Tools, chatTool{Type: "function", Function: chatToolDef{Name: t.Name, Description: t.Description, Parameters: params}})
+	}
+	if len(w.Tools) > 0 {
+		// Observed on Bedrock (us.openai.gpt-5.6-*): /v1/chat/completions rejects function tools
+		// unless reasoning_effort is "none" ("To use function tools, use /v1/responses or set
+		// reasoning_effort to 'none'"). Chat Completions has no slot to replay reasoning anyway,
+		// so nothing is lost by turning it off on this path.
+		w.ReasoningEffort = "none"
 	}
 	switch r.ToolChoice.Mode {
 	case "", ToolChoiceAuto:
