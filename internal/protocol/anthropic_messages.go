@@ -80,4 +80,4 @@ func (s *anthropicStream) Feed(_ string, data []byte) {
 	}
 }
 
-func (s *anthropicStream) Usage() Usage { return s.u }
+func (s *anthropicStream) Usage() Usage { return s.u.clamp() }

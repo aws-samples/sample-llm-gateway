@@ -61,4 +61,4 @@ func (s *openAIChatStream) Feed(_ string, data []byte) {
 	s.u = chunk.Usage.normalize()
 }
 
-func (s *openAIChatStream) Usage() Usage { return s.u }
+func (s *openAIChatStream) Usage() Usage { return s.u.clamp() }

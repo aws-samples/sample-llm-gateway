@@ -168,8 +168,10 @@ Content-Type: application/json
   客户端拿到的 HTTP 状态仍是 200（响应头早已发出），499 / 504 / 502 只出现在计量、日志和 `llmgw_requests_total` 里。
 - key-auth 拒绝的请求不上报，拒绝决定由控制面作出，无需再回传。
 - 所有候选都在首包前失败时也上报一条，`provider_model_code` 是最后一个尝试的候选。
-- 上报是异步的，客户端响应不依赖上报结果。网络错误、超时、5xx 按指数退避重试 `max_retries` 次后丢弃并计
-  `llmgw_metering_reports_total{result="dropped"}`；控制面返回业务拒绝不重试，计 `result="rejected"`。
+- 上报是异步的，客户端响应不依赖上报结果。网络错误、超时、5xx、**429、408** 按指数退避重试 `max_retries` 次后丢弃并计
+  `llmgw_metering_reports_total{result="dropped"}`；其余 4xx（如 401 token 被轮换）只试一次即丢弃、同样计 `dropped`；
+  控制面 200 但 `accepted: false` 的业务拒绝不重试，计 `result="rejected"`。
+  控制面对上报接口限流时请返回 429 而不是其他 4xx，网关才会退避重试而不是直接丢弃。
 - 进程崩溃会丢队列里未发出的记录。控制面应保留对账或补算任务。
 
 ### usage 口径：三种协议的归一规则

@@ -68,6 +68,30 @@ type Usage struct {
 // Total returns input + cache + output.
 func (u Usage) Total() int64 { return u.Input + u.CacheRead + u.CacheWrite + u.Output }
 
+// clamp zeroes any negative counter. Some OpenAI-compatible servers emit -1 for "unknown";
+// a negative value fed to a Prometheus Counter.Add panics in the request goroutine after
+// the response is already written, which loses the metering record. Every Usage that leaves
+// this package (ParseUsage and each StreamParser.Usage) goes through clamp so the handler
+// never sees a negative field.
+func (u Usage) clamp() Usage {
+	if u.Input < 0 {
+		u.Input = 0
+	}
+	if u.Output < 0 {
+		u.Output = 0
+	}
+	if u.CacheRead < 0 {
+		u.CacheRead = 0
+	}
+	if u.CacheWrite < 0 {
+		u.CacheWrite = 0
+	}
+	if u.Reasoning < 0 {
+		u.Reasoning = 0
+	}
+	return u
+}
+
 // Request is a parsed inbound body with only the fields the gateway needs.
 type Request struct {
 	Model  string
@@ -125,11 +149,11 @@ func (r *Request) Rewrite(p Protocol, providerModel string) ([]byte, error) {
 func ParseUsage(p Protocol, body []byte) Usage {
 	switch p {
 	case OpenAIChat:
-		return parseOpenAIChatUsage(body)
+		return parseOpenAIChatUsage(body).clamp()
 	case OpenAIResponses:
-		return parseResponsesBodyUsage(body)
+		return parseResponsesBodyUsage(body).clamp()
 	case Anthropic:
-		return parseAnthropicMessageUsage(body)
+		return parseAnthropicMessageUsage(body).clamp()
 	}
 	return Usage{}
 }

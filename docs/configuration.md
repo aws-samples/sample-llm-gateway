@@ -96,7 +96,9 @@
 `aws_iam` 的基础凭证来自 AWS SDK 默认凭证链，优先级依次是环境变量、共享配置文件、Web Identity（EKS IRSA 注入的
 `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`）、容器凭证、实例元数据。启动时每个 `aws_iam` provider 会解析一次凭证，
 解析失败直接退出；成功后输出一行 `aws identity resolved` 日志，带解析出的身份 ARN，用于核对跨账号身份是否正确。
-凭证由 SDK 自动缓存和刷新，AssumeRole 的临时凭证也一样。
+凭证由 SDK 自动缓存和刷新，AssumeRole 的临时凭证也一样。网关把缓存的过期窗口设为 5 分钟（带 10% 抖动）：
+凭证距真实过期不足 5 分钟即视为过期、提前换新，避免请求在过期前几毫秒签名、到达 Bedrock 时已过期而收到
+403 `ExpiredTokenException`（这类 403 不触发故障转移，会直接回给客户端）。
 
 ### 样例
 
