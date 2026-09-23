@@ -20,8 +20,12 @@ import (
 type providerRoute struct {
 	ProviderCode      string `json:"providerCode"`
 	ProviderModelCode string `json:"providerModelCode"`
-	Priority          int    `json:"priority"`
-	Weight            int    `json:"weight"`
+	// ProviderProtocol is the wire protocol the provider speaks for this candidate
+	// (openai_chat | openai_responses | anthropic). Empty = same as the inbound request
+	// (pass-through). Set it to route e.g. an Anthropic-speaking client to a GPT model.
+	ProviderProtocol string `json:"providerProtocol,omitempty"`
+	Priority         int    `json:"priority"`
+	Weight           int    `json:"weight"`
 }
 type modelRoute struct {
 	ModelCode string          `json:"modelCode"`

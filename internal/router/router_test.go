@@ -37,3 +37,25 @@ func TestAttemptsOrderByPriorityThenWeight(t *testing.T) {
 		t.Errorf("Models() = %v", got)
 	}
 }
+
+// providerProtocol must flow from the route table through to the candidate (empty when absent).
+func TestAttemptsCarryProviderProtocol(t *testing.T) {
+	r := New()
+	r.Load(&controlplane.Routes{Version: "v1", Models: []controlplane.ModelRoute{{
+		ModelCode: "m",
+		Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "x", ProviderModelCode: "xm", ProviderProtocol: "openai_chat", Priority: 1, Weight: 100},
+			{ProviderCode: "y", ProviderModelCode: "ym", Priority: 2, Weight: 100}, // no providerProtocol
+		},
+	}}})
+	at := r.Attempts("m")
+	if len(at) != 2 {
+		t.Fatalf("want 2, got %d", len(at))
+	}
+	if at[0].ProviderProtocol != "openai_chat" {
+		t.Errorf("providerProtocol not propagated: %q", at[0].ProviderProtocol)
+	}
+	if at[1].ProviderProtocol != "" {
+		t.Errorf("absent providerProtocol should be empty, got %q", at[1].ProviderProtocol)
+	}
+}

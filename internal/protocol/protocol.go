@@ -1,6 +1,9 @@
 // Package protocol contains the minimal body handling for each supported wire
 // protocol: extracting/rewriting the model, making sure usage is emitted, and
-// parsing usage out of streaming and non-streaming responses. No format conversion.
+// parsing usage out of streaming and non-streaming responses. This package does no
+// format conversion; cross-protocol translation lives in the translate sub-package and
+// is only used for route candidates that declare a providerProtocol different from
+// the inbound protocol.
 package protocol
 
 import (
@@ -20,6 +23,15 @@ const (
 	OpenAIResponses Protocol = config.EndpointOpenAIResponses
 	Anthropic       Protocol = config.EndpointAnthropic
 )
+
+// Valid reports whether p is one of the three supported wire protocols.
+func (p Protocol) Valid() bool {
+	switch p {
+	case OpenAIChat, OpenAIResponses, Anthropic:
+		return true
+	}
+	return false
+}
 
 // UpstreamPath is the path appended to the provider's base URL for each protocol.
 func (p Protocol) UpstreamPath() string {

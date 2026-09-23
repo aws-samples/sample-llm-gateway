@@ -75,6 +75,7 @@ type fakeUpstream struct {
 	mu       sync.Mutex
 	lastBody map[string]any
 	lastHdr  http.Header
+	lastPath string
 	fail     int  // status to return instead of success, 0 = ok
 	bigBody  int  // when >0, non-stream /messages returns a 200 body of this many bytes
 	negUsage bool // when true, non-stream /messages returns negative token counts (some servers emit -1 for "unknown")
@@ -86,7 +87,7 @@ func (u *fakeUpstream) handler() http.Handler {
 		var m map[string]any
 		_ = json.Unmarshal(body, &m)
 		u.mu.Lock()
-		u.lastBody, u.lastHdr = m, r.Header.Clone()
+		u.lastBody, u.lastHdr, u.lastPath = m, r.Header.Clone(), r.URL.Path
 		fail := u.fail
 		big := u.bigBody
 		neg := u.negUsage
@@ -122,10 +123,30 @@ func (u *fakeUpstream) handler() http.Handler {
 				fl.Flush()
 				time.Sleep(5 * time.Millisecond)
 			}
+		case strings.HasSuffix(r.URL.Path, "/responses") && !stream:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-x-real","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2},"total_tokens":36}}`)
+		case strings.HasSuffix(r.URL.Path, "/responses"):
+			// Data-only frames with data.type, as Bedrock/OpenAI emit them.
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, d := range []string{
+				`{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-x-real","output":[]}}`,
+				`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}`,
+				`{"type":"response.output_text.delta","sequence_number":2,"output_index":0,"content_index":0,"item_id":"msg_1","delta":"hi"}`,
+				`{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}}`,
+				`{"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-x-real","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":10},"output_tokens_details":{"reasoning_tokens":2},"total_tokens":36}}}`,
+			} {
+				_, _ = fmt.Fprint(w, "data: "+d+"\n\n")
+			}
+		case strings.HasSuffix(r.URL.Path, "/chat/completions") && !stream:
+			// Non-stream chat completion with a tool call (exercises the Anthropic ← Chat codec).
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-x-real","choices":[{"index":0,"message":{"role":"assistant","content":"Running it.","tool_calls":[{"id":"call_9","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":15},"completion_tokens_details":{"reasoning_tokens":2}}}`)
 		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n")
-			_, _ = fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":15},\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n")
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-x-real\",\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":15},\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n")
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		default:
 			w.WriteHeader(404)
@@ -138,9 +159,17 @@ type harness struct {
 	cp  *fakeCP
 	up  *fakeUpstream
 	up2 *fakeUpstream
+	rt  *router.Router
 }
 
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessCfg(t, nil)
+}
+
+// newHarnessCfg lets a test adjust the config before the handler is built (no data race with
+// the serving goroutines).
+func newHarnessCfg(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 	cp := &fakeCP{}
 	cpSrv := httptest.NewServer(cp.handler())
@@ -160,11 +189,16 @@ func newHarness(t *testing.T) *harness {
 	cfg.Server.MaxFailoverAttempts = 3
 	cfg.ControlPlane.KeyAuthTimeout = time.Second
 	cfg.ControlPlane.TokenHeader = "X-HIGRESS-Token"
+	if mutate != nil {
+		mutate(cfg)
+	}
 	cfg.Providers = map[string]config.ProviderConfig{
 		"primary": {Auth: config.AuthXAPIKey, APIKey: "up-key", Endpoints: map[string]string{
 			config.EndpointAnthropic: upSrv.URL + "/v1", config.EndpointOpenAIChat: upSrv.URL + "/v1"}},
+		// backup also declares a responses endpoint so unsupported-direction tests can reach the
+		// translate.Supported guard; primary deliberately lacks it (see TestMissingKeyAndModelAndUnknownRoute).
 		"backup": {Auth: config.AuthBearer, APIKey: "b-key", Endpoints: map[string]string{
-			config.EndpointAnthropic: up2Srv.URL + "/v1"}},
+			config.EndpointAnthropic: up2Srv.URL + "/v1", config.EndpointOpenAIResponses: up2Srv.URL + "/v1"}},
 	}
 	reg, err := provider.Build(context.Background(), cfg.Providers)
 	if err != nil {
@@ -196,7 +230,7 @@ func newHarness(t *testing.T) *harness {
 	mux.Handle("/", h)
 	gw := httptest.NewServer(mux)
 	t.Cleanup(gw.Close)
-	return &harness{gw: gw, cp: cp, up: up, up2: up2}
+	return &harness{gw: gw, cp: cp, up: up, up2: up2, rt: rt}
 }
 
 func post(t *testing.T, url, key, body string, hdr map[string]string) (*http.Response, string) {
@@ -332,6 +366,38 @@ func TestNegativeUsageDoesNotPanicAndStillReports(t *testing.T) {
 	r := reps[0]
 	if r.StatusCode != 200 || r.InputTokens != 0 || r.OutputTokens != 0 || r.CacheReadTokens != 0 || r.CacheWriteTokens != 0 {
 		t.Errorf("negative counters should be clamped to 0 in the report: %+v", r)
+	}
+}
+
+// M2: providerProtocol == inbound protocol is still pass-through (no translation), works as today.
+func TestProviderProtocolSameAsInboundPassesThrough(t *testing.T) {
+	h := newHarness(t)
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		{ModelCode: "claude-same", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "global.anthropic.claude-x",
+				ProviderProtocol: "anthropic", Priority: 1, Weight: 100},
+		}},
+	}})
+	resp, body := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"claude-same","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("providerProtocol==inbound should pass through, got %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "msg_1") {
+		t.Errorf("expected upstream body, got %s", body)
+	}
+}
+
+// M2: an unknown providerProtocol value is rejected, not treated as pass-through.
+func TestProviderProtocolUnknownRejected(t *testing.T) {
+	h := newHarness(t)
+	h.rt.Load(&controlplane.Routes{Version: "v", Models: []controlplane.ModelRoute{
+		{ModelCode: "bogus-proto", Providers: []controlplane.ProviderRoute{
+			{ProviderCode: "primary", ProviderModelCode: "x", ProviderProtocol: "grpc", Priority: 1, Weight: 100},
+		}},
+	}})
+	resp, _ := post(t, h.gw.URL+"/v1/messages", "sk-client", `{"model":"bogus-proto","max_tokens":5,"messages":[]}`, nil)
+	if resp.StatusCode != 502 {
+		t.Fatalf("unknown providerProtocol should be rejected, got %d", resp.StatusCode)
 	}
 }
 

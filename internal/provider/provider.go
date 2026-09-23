@@ -23,7 +23,14 @@ type Provider struct {
 	Code      string
 	endpoints map[string]*url.URL // keyed by config.Endpoint* protocol names
 	auth      Authenticator
+	bedrock   bool // auth is aws_iam → this is an Amazon Bedrock endpoint (drives target-specific compat)
 }
+
+// IsBedrock reports whether this provider talks to Amazon Bedrock (auth aws_iam). Protocol
+// translation uses it to apply Bedrock-only request quirks (e.g. reasoning_effort=none is required
+// on Bedrock's /chat/completions when function tools are present) without imposing them on
+// direct OpenAI/Anthropic or third-party OpenAI-compatible endpoints.
+func (p *Provider) IsBedrock() bool { return p.bedrock }
 
 // Registry maps providerCode to Provider.
 type Registry map[string]*Provider
@@ -54,6 +61,7 @@ func Build(ctx context.Context, cfgs map[string]config.ProviderConfig) (Registry
 				return nil, fmt.Errorf("provider %q: %w", code, err)
 			}
 			p.auth = a
+			p.bedrock = true
 		default:
 			return nil, fmt.Errorf("provider %q: unsupported auth %q", code, pc.Auth)
 		}

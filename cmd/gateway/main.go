@@ -1,5 +1,7 @@
-// Command gateway is a lightweight pass-through LLM proxy that integrates with the
-// customer's model-gateway control plane for key-auth, routing and metering.
+// Command gateway is a lightweight LLM proxy that integrates with the customer's
+// model-gateway control plane for key-auth, routing and metering. Requests pass through
+// unchanged by default; a route candidate may declare providerProtocol to have the gateway
+// translate between the OpenAI Chat Completions, OpenAI Responses and Anthropic Messages APIs.
 package main
 
 import (

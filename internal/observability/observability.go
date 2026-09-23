@@ -40,7 +40,13 @@ type Metrics struct {
 	MeteringQueue   prometheus.Gauge
 	RoutesModels    prometheus.Gauge
 	RoutesRejected  prometheus.Counter
-	registry        *prometheus.Registry
+	// Translations counts cross-protocol requests by direction and outcome:
+	// ok | request_error | response_error | stream_error.
+	Translations *prometheus.CounterVec
+	// TranslationDefaults counts fields the gateway filled in because the target protocol
+	// requires them and the client omitted them (field="max_tokens").
+	TranslationDefaults *prometheus.CounterVec
+	registry            *prometheus.Registry
 }
 
 func NewMetrics() *Metrics {
@@ -80,10 +86,17 @@ func NewMetrics() *Metrics {
 		RoutesRejected: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "llmgw_routes_rejected_total", Help: "Route snapshots refused because they were empty while a non-empty snapshot was loaded.",
 		}),
+		Translations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_translations_total", Help: "Cross-protocol requests by inbound protocol, target protocol and result (ok, request_error, response_error, stream_error).",
+		}, []string{"inbound", "target", "result"}),
+		TranslationDefaults: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_translation_defaults_total", Help: "Fields the gateway defaulted during protocol translation because the client omitted them (e.g. max_tokens).",
+		}, []string{"field"}),
 		registry: prometheus.NewRegistry(),
 	}
 	m.registry.MustRegister(m.Requests, m.Duration, m.TTFT, m.Tokens, m.KeyAuthRejects, m.KeyAuthErrors,
-		m.Failovers, m.MeteringReports, m.MeteringQueue, m.RoutesModels, m.RoutesRejected)
+		m.Failovers, m.MeteringReports, m.MeteringQueue, m.RoutesModels, m.RoutesRejected,
+		m.Translations, m.TranslationDefaults)
 	m.registry.MustRegister(prometheus.NewGoCollector())
 	return m
 }

@@ -20,6 +20,11 @@ type ProviderRoute struct {
 	ProviderModelCode string `json:"providerModelCode"`
 	Priority          int    `json:"priority"`
 	Weight            int    `json:"weight"`
+	// ProviderProtocol is the wire protocol this provider speaks (openai_chat / openai_responses /
+	// anthropic). Empty means "same as the inbound request", i.e. pass-through with no format
+	// conversion (the historical behavior). When set and different from the inbound protocol, the
+	// gateway translates the request/response/stream between the two.
+	ProviderProtocol string `json:"providerProtocol,omitempty"`
 }
 
 // ModelRoute maps a user-visible model code to its providers.

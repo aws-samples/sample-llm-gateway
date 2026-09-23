@@ -29,7 +29,8 @@ If-None-Match: <上次的 ETag>      # 首次不带
       "modelCode": "claude-sonnet-5",
       "providers": [
         { "providerCode": "bedrock-usw2-xacct", "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 10, "weight": 100 },
-        { "providerCode": "bedrock",            "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 20, "weight": 100 }
+        { "providerCode": "bedrock",            "providerModelCode": "global.anthropic.claude-sonnet-5", "priority": 20, "weight": 100 },
+        { "providerCode": "bedrock",            "providerModelCode": "us.openai.gpt-5.6-sol", "providerProtocol": "openai_chat", "priority": 30, "weight": 100 }
       ]
     }
   ]
@@ -41,6 +42,13 @@ If-None-Match: <上次的 ETag>      # 首次不带
 - `modelCode`：客户端在请求体 `model` 里写的名字，也是 key-auth 和计量里的 `model_code`。
 - `providerCode`：必须与网关配置 `providers` 的 key 一致，否则该候选被跳过并记 `route references unconfigured provider` 日志。
 - `providerModelCode`：转发时替换进请求体 `model` 的字符串，网关不做任何加工，计量里原样上报。
+- `providerProtocol`（可选）：该候选的 provider 说哪种协议，取值 `openai_chat` / `openai_responses` / `anthropic`，
+  必须是该 provider 在网关配置里声明了 `endpoints.<providerProtocol>` 的协议。
+  - **不填 = 与入站请求同协议 = 纯透传**（历史行为，老路由不受影响）。
+  - 填了且与入站协议不同时，网关做协议转换：请求体转成 provider 协议、响应/SSE 转回客户端协议。
+    上例第三个候选让用 Anthropic Messages 协议（如 Claude Code）请求 `claude-sonnet-5` 的客户端，在前两层都失败时落到 GPT。
+    六个方向都支持；细节与有损点见 README「Protocol translation」和 `docs/protocol-translation-design.md`。
+  - 填了非法值：该候选被跳过并记 `route has unknown providerProtocol` 日志（不当透传，避免把错误配置静默成功）。
 - `priority`：数值小的先试。同一模型的候选按 priority 分层，前一层全部失败（首包前）才试下一层。
 - `weight`：同一层内按权重随机排序，权重越大越可能排前。0 或负数按 1 处理，不会导致候选被排除。
 - `version`：网关只用作日志和 `/readyz` 展示，判断是否变化靠 ETag。
@@ -111,9 +119,10 @@ Anthropic 格式：
 { "type": "error", "error": { "type": "rate_limit_error", "message": "monthly quota exhausted" } }
 ```
 
-网关自身产生的其他错误也用同样的两种格式：400（请求体不是 JSON、缺 `model`）、401（未携带 key）、404（模型没有路由）、
-405、413、502（所有候选都失败）、503（控制面不可用）、504（`request_timeout` 到期）。上游返回的错误则原样透传，
-状态码、响应体、`Content-Type` 都不改。
+网关自身产生的其他错误也用同样的两种格式：400（请求体不是 JSON、缺 `model`、协议转换时请求体含无法转换的字段如 `previous_response_id`）、
+401（未携带 key）、404（模型没有路由）、405、413、502（所有候选都失败；协议转换时上游响应体无法转换）、503（控制面不可用）、
+504（`request_timeout` 到期）。上游返回的错误在透传路由上原样透传，状态码、响应体、`Content-Type` 都不改；
+在协议转换路由上状态码不变，响应体按客户端协议重新渲染（provider 的错误格式客户端 SDK 解析不了）。
 
 ## usage/report
 

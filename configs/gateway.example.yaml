@@ -15,6 +15,7 @@ server:
   max_request_body_bytes: 33554432     # 32 MiB
   max_failover_attempts: 3
   log_level: info
+  # default_max_tokens: 8192           # 仅协议转换路由用：客户端没给 max_tokens 而目标协议（Anthropic）必填时补的值；0/不写 = 8192
 
 control_plane:
   base_url: "${CP_BASE_URL}"           # 生产请用 https；token 与客户 key 每次调用都随行，明文 http 会泄露
