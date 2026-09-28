@@ -50,7 +50,7 @@ The gateway provides:
 - Asynchronous token usage reporting with a bounded in-memory queue and retries.
 - Health checks, Prometheus metrics, structured JSON logs, and a model listing endpoint.
 
-For Amazon Bedrock, the gateway signs requests with AWS Signature Version 4 (SigV4) using the AWS SDK default credential chain. Optional AWS Security Token Service (AWS STS) role assumption supports cross-account access. Configurable endpoints support cross-Region and private connectivity when the required IAM and networking resources are in place.
+For Amazon Bedrock, the gateway signs requests with AWS Signature Version 4 (SigV4) using the AWS SDK default credential chain. Optional AWS Security Token Service (AWS STS) role assumption supports cross-account access. Configurable endpoints support cross-Region and private connectivity when the required IAM and networking resources are in place. Bedrock can be reached through its native protocol endpoints or, per provider, through the SDK `InvokeModel` API.
 
 The gateway does not issue API keys, calculate prices, deduct quotas, persist usage records, or provide a management UI. It does not create a public ingress endpoint. These responsibilities remain with your control plane and deployment infrastructure.
 
@@ -241,6 +241,21 @@ With this route, a Claude Code session pointed at `/v1/messages` with `ANTHROPIC
 | Metering | Usage is parsed from the raw upstream bytes with the provider protocol's parser, exactly as for a pass-through request of that protocol. |
 
 The codecs are covered by golden tests built from recorded Claude Code, Codex, and OpenAI SDK traffic, and every direction has been exercised end to end against Amazon Bedrock with those clients. Translation is still lossy by nature: provider-specific fields outside the list above are not carried across, and the model behind the route must support the requested capabilities (for example tool calling). See [docs/protocol-translation-design.md](docs/protocol-translation-design.md) for the mapping tables and decisions.
+
+### Bedrock InvokeModel transport
+
+An `aws_iam` provider can declare `endpoints.bedrock_invoke` (a bedrock-runtime host, no path) instead of, or in addition to, the native protocol endpoints. Requests whose target protocol has no native endpoint on that provider are then sent through the AWS SDK `InvokeModel` / `InvokeModelWithResponseStream` API, the call path used by SDK-based gateways. The body stays in the target protocol's native format: Anthropic Messages for Claude, OpenAI Chat Completions for GPT. InvokeModel does not accept the Responses format, so Responses clients reach GPT on this transport through `providerProtocol: openai_chat`.
+
+```yaml
+providers:
+  bedrock-invoke-usw2:
+    auth: aws_iam
+    region: us-west-2
+    endpoints:
+      bedrock_invoke: "https://bedrock-runtime.us-west-2.amazonaws.com"
+```
+
+The gateway removes `model` and `stream` from the body, adds `anthropic_version: bedrock-2023-05-31` and folds `anthropic-beta` headers into `anthropic_beta` for Claude, and rebuilds the event stream as the native endpoint's SSE (`event:` lines for Anthropic, `data:` lines ending with `data: [DONE]` for Chat Completions). Bedrock status codes are preserved, so 429/5xx still fail over; SDK retries are disabled. Pass-through, protocol translation, and metering work unchanged on this transport. See [docs/configuration.md](docs/configuration.md) for the full behavior and the differences observed against the native endpoints.
 
 Before committing to a response, the gateway can try another candidate on local credential/signing errors, transport errors, or HTTP 429/5xx responses. Attempts are bounded by `max_failover_attempts` (default: 3) and the overall request timeout. Other upstream HTTP errors, including 401 and 403, are passed through. The last candidate's HTTP 429/5xx response can also be passed through; failures without a committed upstream response generally produce HTTP 502 or 504. There is no failover after response relay begins.
 

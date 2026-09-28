@@ -212,7 +212,7 @@ providers:
    ```bash
    kubectl port-forward -n llm-gateway svc/llm-gateway 8080:8080 &
    kubectl port-forward -n llm-gateway svc/mock-controlplane 9090:9090 &
-   CLAUDE_MODELS="claude-sonnet-5-us claude-opus-5-us" GPT_MODELS="gpt-5.6-sol-us gpt-5.6-luna-us" \
+   CLAUDE_MODELS="claude-sonnet-5-us claude-opus-5-us" GPT_MODELS="gpt-5.6-sol-us gpt-5.6-luna-us gpt-6-astra-us gpt-6-sol-us gpt-6-luna-us" \
      GW=http://localhost:8080 CP=http://localhost:9090 KEY=sk-demo-key scripts/smoke.sh
    ```
 

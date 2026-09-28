@@ -23,7 +23,8 @@ type Provider struct {
 	Code      string
 	endpoints map[string]*url.URL // keyed by config.Endpoint* protocol names
 	auth      Authenticator
-	bedrock   bool // auth is aws_iam → this is an Amazon Bedrock endpoint (drives target-specific compat)
+	bedrock   bool            // auth is aws_iam → this is an Amazon Bedrock endpoint (drives target-specific compat)
+	invoke    *bedrockInvoker // set when the provider has a bedrock_invoke endpoint
 }
 
 // IsBedrock reports whether this provider talks to Amazon Bedrock (auth aws_iam). Protocol
@@ -62,6 +63,10 @@ func Build(ctx context.Context, cfgs map[string]config.ProviderConfig) (Registry
 			}
 			p.auth = a
 			p.bedrock = true
+			if u, ok := p.endpoints[config.EndpointBedrockInvoke]; ok {
+				// Same credentials as the SigV4 signer: IRSA / AssumeRole chain and early refresh.
+				p.invoke = newBedrockInvoker(a.creds, pc.Region, u)
+			}
 		default:
 			return nil, fmt.Errorf("provider %q: unsupported auth %q", code, pc.Auth)
 		}

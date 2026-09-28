@@ -265,6 +265,9 @@ func defaultRoutes() routes {
 		one("claude-opus-5", "bedrock", "global.anthropic.claude-opus-5"),
 		one("gpt-5.6-sol", "bedrock", "global.openai.gpt-5.6-sol"),
 		one("gpt-5.6-luna", "bedrock", "global.openai.gpt-5.6-luna"),
+		one("gpt-6-astra", "bedrock", "global.openai.gpt-6-astra"),
+		one("gpt-6-sol", "bedrock", "global.openai.gpt-6-sol"),
+		one("gpt-6-luna", "bedrock", "global.openai.gpt-6-luna"),
 	}}
 }
 

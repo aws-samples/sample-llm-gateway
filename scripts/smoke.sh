@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 端到端冒烟：4 个模型 x 协议 x 流式/非流式 + 负向用例，
+# 端到端冒烟：默认 7 个模型（Claude 两档 + GPT-5.6 两档 + GPT-6 三档）x 协议 x 流式/非流式 + 负向用例，
 # 最后核对控制面是否收到计量上报。
 # Usage: GW=http://localhost:8080 CP=http://localhost:9090 KEY=sk-demo-key scripts/smoke.sh
 set -u
@@ -9,7 +9,7 @@ KEY=${KEY:-sk-demo-key}
 # 可用环境变量覆盖被测模型列表（空格分隔），例如跨账号路由：CLAUDE_MODELS="claude-sonnet-5-us" GPT_MODELS="gpt-5.6-sol-us"
 # 显式设为空串就跳过那组协议（只测一家外接供应商时用），例如 CLAUDE_MODELS="" RESPONSES_MODELS="" GPT_MODELS="kimi"
 CLAUDE_MODELS=${CLAUDE_MODELS-"claude-sonnet-5 claude-opus-5"}
-GPT_MODELS=${GPT_MODELS-"gpt-5.6-sol gpt-5.6-luna"}
+GPT_MODELS=${GPT_MODELS-"gpt-5.6-sol gpt-5.6-luna gpt-6-astra gpt-6-sol gpt-6-luna"}
 RESPONSES_MODELS=${RESPONSES_MODELS-$GPT_MODELS}
 C1=${CLAUDE_MODELS%% *}; G1=${GPT_MODELS%% *}
 # 负向用例与 x-api-key 用例各需要一个能路由的模型：优先用各自协议的第一个模型；某个列表为空（只测一种协议）时借用另一个

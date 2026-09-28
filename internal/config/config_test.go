@@ -69,3 +69,27 @@ func TestValidateBaseURLScheme(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateBedrockInvokeEndpointNeedsAWSIAM(t *testing.T) {
+	cases := []struct {
+		name    string
+		p       ProviderConfig
+		wantErr bool
+	}{
+		{"aws_iam ok", ProviderConfig{Auth: AuthAWSIAM, Region: "us-west-2",
+			Endpoints: map[string]string{EndpointBedrockInvoke: "https://bedrock-runtime.us-west-2.amazonaws.com"}}, false},
+		{"bearer rejected", ProviderConfig{Auth: AuthBearer, APIKey: "k",
+			Endpoints: map[string]string{EndpointBedrockInvoke: "https://bedrock-runtime.us-west-2.amazonaws.com"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := minimalValid()
+			c.ControlPlane.BaseURL = "https://cp.example.com"
+			c.Providers["inv"] = tc.p
+			err := c.validate()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("wantErr=%v, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}

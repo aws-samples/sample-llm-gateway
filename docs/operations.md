@@ -77,6 +77,22 @@ token，改 secret，重启网关，确认日志 `secret resolved` 的 `version_
   这些在转换路径里由网关处理，但透传路径需要客户端自己满足。其中 `reasoning_effort: "none"` 只对 `auth: aws_iam` 的 provider（即 Bedrock）写入，
   直连 OpenAI 或第三方兼容端点的转换请求不带这个字段。
 
+### 经 SDK InvokeModel 接 Bedrock（bedrock_invoke）与引导 SDK 网关接 GPT
+
+provider 只配 `endpoints.bedrock_invoke` 时，网关走 AWS SDK 的 `InvokeModel` / `InvokeModelWithResponseStream`，与用 SDK 调 Bedrock 的网关同一条路径
+（字段与行为见 configuration.md「经 SDK InvokeModel 调 Bedrock」）。用途有两个：复现 SDK 网关的问题，以及验证给 SDK 网关的接入建议。
+
+SDK 网关接 Bedrock 上的 GPT，按下面几条核对（2026-09-23 在 us-west-2 与 ap-northeast-1 用 `global.openai.gpt-5.6-sol` 实测）：
+
+- InvokeModel 的 body 是 **OpenAI Chat Completions** 格式，模型 ID 用 `global.openai.gpt-5.6-sol` 这类跨区域 profile。Responses 格式（`input` /
+  `max_output_tokens`）直接 400。只会发 Responses 的客户端（Codex）要先转成 Chat：本网关的做法是路由候选带 `providerProtocol: openai_chat`。
+- 非流式调用 body 里不能有 `"stream": true`（400 `The 'stream' parameter was set to 'true', but must be 'false' or null`），流式调用可以有。
+  `model` 字段可有可无；Claude 的 body 里若带 `model`，必须是合法模型 ID。
+- 流式返回的每个 chunk 是一个 `chat.completion.chunk`，最后一个带 `usage`，不需要 `stream_options.include_usage`。
+- 带 function tools 时必须 `reasoning_effort: "none"`，否则 400 `Function tools with reasoning_effort are not supported`，与原生 `/openai/v1/chat/completions` 一致。
+- IAM action 是 `bedrock:InvokeModel`、`bedrock:InvokeModelWithResponseStream`，资源含 `inference-profile/*` 与 `foundation-model/*`。
+- 端点必须是 `bedrock-runtime.<region>.amazonaws.com`（或 bedrock-runtime 的 VPC Endpoint）。指到别的 Bedrock 主机时 SDK 报 404 `deserialization failed ... invalid character '<'`，见故障排查。
+
 ### 本地验证外接 API 供应商
 
 接 OpenAI 兼容或 Anthropic 格式的第三方 API，不需要 AWS 凭证，在本机就能把整条链路（鉴权、路由、模型码替换、流式透传、
@@ -221,6 +237,7 @@ stdout，一行一条 JSON。级别由 `server.log_level` 控制。
 | 转换路由 400 `protocol translation: ...` | 客户端请求体含无法跨协议表达的字段，最常见是 Responses 的 `previous_response_id`（网关无状态） | `llmgw_translations_total{result="request_error"}`；日志 `protocol translation: request rejected` | 客户端改为 `store: false` 并自带完整历史（Codex 默认如此） |
 | 转换路由 502 `protocol translation of upstream response failed` | 上游返回了 codec 没见过的响应形状 | `llmgw_translations_total{result="response_error"}`；日志带上游片段 | 反馈给维护者补 codec；临时可把该候选的 `providerProtocol` 去掉换回透传（如果客户端协议与供应商一致） |
 | 转换路由的回答被截断、`stop_reason: max_tokens` | 客户端没带 max_tokens，网关补的默认值不够 | `llmgw_translation_defaults_total{field="max_tokens"}` 有增长 | 调大 `server.default_max_tokens`，或让客户端显式传 |
+| 404 `operation error Bedrock Runtime: InvokeModel... StatusCode: 404 ... deserialization failed, failed to decode response body, invalid character '<'` | `bedrock_invoke` 指到了不是 bedrock-runtime 的主机（`bedrock.`、`bedrock-agent-runtime.`、别的服务的 VPC Endpoint），对端回 HTML/XML 的 404，SDK 按 JSON 解析失败。基于 AWS SDK 的网关配错端点也是这一行报错 | 错误里 RequestID 是 UUID 格式（说明到了某个 AWS 服务，只是不是 bedrock-runtime）；模型 ID 写错是 400 JSON `ValidationException`，不会是这个 | 把端点改成 `https://bedrock-runtime.<region>.amazonaws.com` 或 bedrock-runtime 的 VPC Endpoint 专属域名 |
 | 502 `... upstream status 5xx` / 504 | 所有候选都在首包前失败 | `llmgw_upstream_failovers_total` 按 provider 看；日志有上游 body 片段 | 供应商侧问题；考虑加备用候选 |
 | 502 `upstream response body exceeds gateway limit` | 非流式响应体超过 64 MiB 上限，网关拒绝转发截断内容 | 日志 `upstream response body too large, rejecting` 带 `limit_bytes`/`upstream_status`；计量记 502、token 0 | 该响应确实过大；需要大响应时改用流式，或评估上限 |
 | Bedrock 返回 401/403 `not authorized to perform: bedrock:InvokeModel on resource: ...project/default` | Responses API 需要 `project/default` 资源权限，IAM 策略未授予 | 只有 `/v1/responses` 失败，messages / chat 正常 | IAM 策略加 `arn:aws:bedrock:*:*:project/default`；跨账号时是对端角色的策略 |

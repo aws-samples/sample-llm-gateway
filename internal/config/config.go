@@ -16,6 +16,11 @@ const (
 	EndpointOpenAIChat      = "openai_chat"
 	EndpointOpenAIResponses = "openai_responses"
 	EndpointAnthropic       = "anthropic"
+	// EndpointBedrockInvoke is not a protocol: it is the bedrock-runtime host the gateway calls
+	// through the SDK InvokeModel / InvokeModelWithResponseStream API. Requests whose target
+	// protocol is anthropic or openai_chat go there when the provider has no native endpoint
+	// for that protocol. Requires auth aws_iam.
+	EndpointBedrockInvoke = "bedrock_invoke"
 )
 
 // Auth modes for providers.
@@ -217,6 +222,10 @@ func (c *Config) validate() error {
 		for name := range p.Endpoints {
 			switch name {
 			case EndpointOpenAIChat, EndpointOpenAIResponses, EndpointAnthropic:
+			case EndpointBedrockInvoke:
+				if p.Auth != AuthAWSIAM {
+					return fmt.Errorf("provider %q: endpoint %q requires auth=aws_iam", code, name)
+				}
 			default:
 				return fmt.Errorf("provider %q: unknown endpoint %q", code, name)
 			}

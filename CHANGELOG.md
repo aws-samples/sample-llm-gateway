@@ -1,5 +1,46 @@
 # 更新记录
 
+## 2026-09-28（未发新镜像）
+
+### 路由样例与冒烟覆盖 GPT-6 三档
+
+- mock 控制面内置路由与 `deploy/k8s/20-mock-controlplane.yaml` 新增 `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna`（东京 `bedrock`）及对应 `-us` 跨账号路由，
+  `providerModelCode` 用 `global.openai.gpt-6-*`；路由版本改为 `poc-xacct-2`。网关代码对模型码零加工，本次无代码行为变化。
+- `scripts/smoke.sh` 默认 `GPT_MODELS` 扩为 gpt-5.6 两档 + gpt-6 三档；docs/private-networking.md 跨账号冒烟示例同步。
+- 东京 PoC 实测：本账号 7 模型 29 项全过、计量 25 条无缺失；跨账号 GPT-6 Chat 流式/非流式全 200，`/v1/responses` 跨账号仍 401
+  （对端角色缺 `project/default`，与 gpt-5.6 一致）；`bedrock_invoke` 路径 `global.openai.gpt-6-astra` 透传与 Responses→Chat 转换均 200。
+
+## 2026-09-23（未发新镜像）
+
+### 新增：经 SDK InvokeModel 调 Bedrock（`endpoints.bedrock_invoke`）
+
+- `aws_iam` provider 可配 `endpoints.bedrock_invoke`（bedrock-runtime 主机，不带路径）。目标协议是 `anthropic` / `openai_chat` 且该 provider
+  没有对应原生端点时，网关用 AWS SDK 的 `InvokeModel` / `InvokeModelWithResponseStream` 调用，与基于 AWS SDK 的网关同一条路径；原生端点优先，已有配置不受影响。
+- body 仍是目标协议原生 JSON：删 `model` / `stream`，Claude 补 `anthropic_version: bedrock-2023-05-31` 并把 `anthropic-beta` 头并入 `anthropic_beta`，
+  GPT 非流式去掉 `stream_options`。流式 event-stream 还原成原生端点的 SSE，透传、协议转换、计量对这条路径无感知。
+- Bedrock 状态码保留（429 / 5xx 照常故障转移），错误 body 按目标协议格式、`message` 带 SDK 原始错误文本；流中途异常先发该协议的 error 事件再按上游中断计量；
+  连接失败走故障转移。SDK 自带重试关闭，复用网关上游 HTTP 客户端与 `aws_iam` 凭证链。
+- 新依赖 `github.com/aws/aws-sdk-go-v2/service/bedrockruntime`。
+- 文档：configuration.md 新增「经 SDK InvokeModel 调 Bedrock」；operations.md 新增接入要点（含引导 SDK 网关接 GPT 的核对清单）与
+  `deserialization failed ... invalid character '<'` 排查条目；README 新增 Bedrock InvokeModel transport 节。
+
+### 合入 GitHub #2：Chat Completions / Responses / Messages 协议转换
+
+- 路由候选可选字段 `providerProtocol`（`openai_chat` / `openai_responses` / `anthropic`），与入站协议不同时网关在三种协议间双向转换请求、
+  非流式响应与 SSE 流，六个方向全部支持；不填该字段的路由行为不变（纯透传）。已用 Claude Code → GPT、Codex → Claude 等真实客户端在 Bedrock 上验收。
+- 新增配置 `server.default_max_tokens`（默认 8192）：转换到 Anthropic 且客户端未带 max_tokens 时补入。
+- 新增指标 `llmgw_translations_total{inbound,target,result}`、`llmgw_translation_defaults_total{field}`。
+- 转换路由上：上游错误按客户端协议重渲染（状态码不变）；`previous_response_id` 返 400；流中途转换失败返客户端协议的 error 事件并按中断计量（新增 truncated 原因 `translation_error`）。
+- mock 控制面路由结构体增加 `providerProtocol`；新增开发工具 `tools/recordproxy`（录制真实流量作 golden fixture，不进镜像）。
+- 文档：README 新增 Protocol translation 节并撤销「不做协议转换」声明；新增 docs/protocol-translation-design.md、docs/protocol-translation-report.md。
+
+### 合入 GitHub #1：代码审查修复（第二批）
+
+- 负数 token（部分 OpenAI 兼容服务用 -1 表示未知）统一置 0，避免 Prometheus Counter.Add panic 丢计量。
+- 控制面客户端：不跟随重定向（防 token 与 apiKey 被带到别的主机）；model-routes 缺 `models` 键时报错而不是当空表；429 / 408 按可重试处理；
+  key-auth 只解码网关用到的字段。
+- Bedrock 凭证缓存提前 5 分钟（10% 抖动）刷新，避免临近过期签名导致 403 `ExpiredTokenException`。
+
 ## 2026-09-10（不发新镜像）
 
 - 清零 GitHub CodeQL 报出的 5 条 `go/clear-text-logging`（high）。都是误报路径，但顺手把两处消掉：

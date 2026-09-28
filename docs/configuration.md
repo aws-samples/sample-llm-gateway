@@ -88,7 +88,7 @@
 | --- | --- | --- |
 | `auth` | 全部 | `bearer`（`Authorization: Bearer <api_key>`）、`x-api-key`（`x-api-key: <api_key>`）、`aws_iam`（SigV4）、`none`。默认 `bearer` |
 | `api_key` | bearer / x-api-key | 必填。明文、`${SOME_ENV}` 或 `secretsmanager://` 引用（见 [secrets](#secrets)） |
-| `endpoints` | 全部 | 至少一项。key 只能是 `openai_chat`、`openai_responses`、`anthropic`，value 是 base URL，网关在其后分别拼 `/chat/completions`、`/responses`、`/messages`。没声明的协议不会被路由到这个 provider |
+| `endpoints` | 全部 | 至少一项。协议 key 是 `openai_chat`、`openai_responses`、`anthropic`，value 是 base URL，网关在其后分别拼 `/chat/completions`、`/responses`、`/messages`。另有一个非协议 key `bedrock_invoke`（仅 `aws_iam`），见下文「[经 SDK InvokeModel 调 Bedrock](#经-sdk-invokemodel-调-bedrockbedrock_invoke)」。没声明的协议不会被路由到这个 provider |
 | `region` | aws_iam | 必填。SigV4 签名区域，即 Bedrock 端点所在区域 |
 | `sts_region` | aws_iam | 可选。STS 调用（IRSA 换凭证、AssumeRole）走的区域，默认依次取 `AWS_REGION`、`AWS_DEFAULT_REGION`、`region`。网关所在区域与端点区域不同且要求全私网时必须显式填网关所在区域 |
 | `role_arn` | aws_iam | 可选。先 AssumeRole 到这个角色再签名，用于 Bedrock 在另一个账号的场景。会话名固定为 `llm-gateway-<providerCode>` |
@@ -140,6 +140,13 @@ providers:
     endpoints:
       anthropic:        "https://api.anthropic.com/v1"
 
+  # Amazon Bedrock，经 SDK InvokeModel / InvokeModelWithResponseStream 调用（与基于 AWS SDK 的网关同一条调用路径）
+  bedrock-invoke-usw2:
+    auth: aws_iam
+    region: us-west-2
+    endpoints:
+      bedrock_invoke:   "https://bedrock-runtime.us-west-2.amazonaws.com"   # 只写主机，不带路径；VPC Endpoint 写专属域名
+
   # 明文方式：从环境变量注入。只提供 OpenAI 兼容 chat 的厂商，路由把它配给 /v1/responses 或 /v1/messages 的请求会被跳过
   moonshot:
     auth: bearer
@@ -151,8 +158,35 @@ providers:
 ### Bedrock 模型码的填写规则
 
 网关对 `providerModelCode` 不做任何加工：控制面配置的字符串原样写入请求体 `model` 字段，计量也上报同一个字符串。
-Bedrock 上请填跨区域 inference profile ID，例如 `global.anthropic.claude-sonnet-5`、`global.openai.gpt-5.6-sol`。
+Bedrock 上请填跨区域 inference profile ID，例如 `global.anthropic.claude-sonnet-5`、`global.openai.gpt-5.6-sol`、`global.openai.gpt-6-astra`。
 `global.` profile 可以从任何支持的区域端点调用，路由到不同区域的 provider 时不需要换模型码。
+
+### 经 SDK InvokeModel 调 Bedrock（bedrock_invoke）
+
+`endpoints.bedrock_invoke` 让网关用 AWS SDK 的 `InvokeModel` / `InvokeModelWithResponseStream` 调 Bedrock，而不是 bedrock-runtime 的
+原生协议端点（`/anthropic/v1`、`/openai/v1`）。请求体仍是目标协议的原生 JSON，只是外层换成 InvokeModel：
+
+| 目标协议 | InvokeModel 里装的 body | 适用模型 |
+| --- | --- | --- |
+| `anthropic` | Anthropic Messages | Claude |
+| `openai_chat` | OpenAI Chat Completions | GPT |
+| `openai_responses` | 不支持（InvokeModel 不接受 Responses 格式，Bedrock 返回 400） | 用 `providerProtocol: openai_chat` 先转成 Chat |
+
+- **何时生效**：候选的目标协议（入站协议，或路由上的 `providerProtocol`）在这个 provider 上没有原生端点、但有 `bedrock_invoke` 时。
+  同一个 provider 两种都配时原生端点优先，已有配置行为不变。
+- **网关对 body 做的改动**：删掉 `model`（模型 ID 走 URL 路径，body 里的 `model` 若保留必须是合法模型 ID）和 `stream`（由调用哪个 API 决定，
+  非流式 API 收到 `"stream": true` 会 400）；Claude 补 `anthropic_version: "bedrock-2023-05-31"`，客户端的 `anthropic-beta` 头并入 body 的
+  `anthropic_beta` 数组；GPT 非流式请求去掉 `stream_options`。
+- **响应**：非流式原样返回 JSON。流式把 event-stream 的每个 chunk 还原成原生端点的 SSE：Claude 带 `event: <type>` 行，GPT 只有 `data:` 行并以
+  `data: [DONE]` 结束。所以透传、协议转换、计量对这条路径完全不感知。
+- **错误**：Bedrock 的 API 错误保留原状态码（429 / 5xx 照常触发故障转移），body 按目标协议的错误格式给出，`message` 里是 SDK 的原始错误文本
+  （含异常名与 RequestID）。流中途的异常（如 `throttlingException`）先给客户端一条该协议的 error 事件，再按上游中断处理（计量 502、不计费）。
+  连不上端点（DNS、TCP、TLS）属于传输错误，走故障转移。
+- **重试与超时**：SDK 自带重试已关闭，统一由网关故障转移；SDK 复用网关上游 HTTP 客户端，`upstream_connect_timeout` /
+  `upstream_response_header_timeout` 同样生效。凭证与 `aws_iam` 签名共用一条凭证链（IRSA、`role_arn`、提前刷新都一样）。
+- **与原生端点的已知差异**（2026-09-23 us-west-2 实测）：同一个请求，Opus 5.5 在原生 `/anthropic/v1/messages` 上默认开启 thinking、
+  在 InvokeModel 上默认不开，输出 token 数和计费会不同；GPT-5.x 带 function tools 时两条路都要求 `reasoning_effort: "none"`，
+  透传请求需要客户端自己带，协议转换路径由网关补。
 
 ## 校验规则
 
@@ -163,7 +197,7 @@ Bedrock 上请填跨区域 inference profile ID，例如 `global.anthropic.claud
 - 至少一个 provider
 - `bearer` / `x-api-key` 必须有 `api_key`
 - `aws_iam` 必须有 `region`；`role_arn` 若填必须以 `arn:aws` 开头
-- 每个 provider 至少一个 endpoint，endpoint 名只能是三个协议名之一，URL 必须带 scheme 和 host
+- 每个 provider 至少一个 endpoint，endpoint 名只能是三个协议名或 `bedrock_invoke`（后者要求 `auth: aws_iam`），URL 必须带 scheme 和 host
 - `aws_iam` provider 的凭证必须能解析（IRSA 配置不完整时在启动阶段即失败，而不是等到第一个请求）
 - `secretsmanager://` 引用必须能取到、值非空（在 provider 初始化之前解析，失败即退出）
 

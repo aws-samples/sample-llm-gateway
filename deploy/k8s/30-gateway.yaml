@@ -39,6 +39,13 @@ data:
           openai_chat:      "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
           openai_responses: "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
           anthropic:        "https://vpce-xxxxxxxxxxxxxxxxx-yyyyyyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/anthropic/v1"
+      # 可选：经 SDK InvokeModel 调 Bedrock（与基于 AWS SDK 的网关同一条路径），见 docs/configuration.md。
+      # 本区域写标准域名（VPCE 私有 DNS 解析成私网地址）；经 peering 访问别的区域写 VPCE 专属域名，并把 sts_region 固定到本区域。
+      bedrock-invoke:
+        auth: aws_iam
+        region: ap-northeast-1
+        endpoints:
+          bedrock_invoke: "https://bedrock-runtime.ap-northeast-1.amazonaws.com"
 ---
 apiVersion: apps/v1
 kind: Deployment

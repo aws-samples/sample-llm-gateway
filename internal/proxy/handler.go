@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -189,8 +190,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			targetProto = tp
 		}
+		// A native endpoint for the target protocol wins; otherwise a bedrock_invoke endpoint
+		// carries the same body through the SDK InvokeModel API.
 		base, ok := prov.Endpoint(string(targetProto))
-		if !ok {
+		useInvoke := !ok && prov.CanInvoke(string(targetProto))
+		if !ok && !useInvoke {
 			log.Warn("provider lacks endpoint for protocol", "provider", cand.ProviderCode, "protocol", targetProto)
 			lastErr = fmt.Errorf("provider %q does not serve %s", cand.ProviderCode, targetProto)
 			continue
@@ -238,30 +242,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				log.Debug("protocol translation: max_tokens defaulted", "target", targetProto, "max_tokens", h.translateOptions().DefaultMaxTokens)
 			}
 		}
-		upURL := *base
-		upURL.Path = strings.TrimRight(base.Path, "/") + targetProto.UpstreamPath()
-		// upURL 只由配置里的 provider base URL 加协议固定路径拼成，不含任何客户端输入（客户端只能影响请求体）。
-		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL.String(), bytes.NewReader(upBody)) // nosemgrep: gosec.G107-1
-		if err != nil {
-			protocol.ErrBadGateway("failed to build upstream request").Write(w, proto)
-			return
-		}
-		upReq.ContentLength = int64(len(upBody))
-		copyRequestHeaders(r.Header, upReq.Header, targetProto, tr != nil)
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("User-Agent", userAgent)
-		if targetProto == protocol.Anthropic && upReq.Header.Get("anthropic-version") == "" {
-			upReq.Header.Set("anthropic-version", defaultAnthropicVers)
-		}
-		if err := prov.Authenticate(ctx, upReq, upBody); err != nil {
-			log.Error("upstream auth failed", "provider", cand.ProviderCode, "err", err)
-			lastErr = err
-			h.metrics.Failovers.WithLabelValues(cand.ProviderCode, "auth").Inc()
-			continue
-		}
-
 		attemptStart := time.Now()
-		resp, err := h.client.Do(upReq)
+		var resp *http.Response
+		if useInvoke {
+			hdr := http.Header{}
+			copyRequestHeaders(r.Header, hdr, targetProto, tr != nil)
+			resp, err = prov.Invoke(ctx, h.client, string(targetProto), cand.ProviderModelCode, upBody, hdr, preq.Stream)
+		} else {
+			resp, err = h.send(ctx, r, prov, base, targetProto, tr != nil, upBody)
+			if errors.Is(err, errUpstreamAuth) {
+				log.Error("upstream auth failed", "provider", cand.ProviderCode, "err", err)
+				lastErr = err
+				h.metrics.Failovers.WithLabelValues(cand.ProviderCode, "auth").Inc()
+				continue
+			}
+			if errors.Is(err, errBuildRequest) {
+				protocol.ErrBadGateway("failed to build upstream request").Write(w, proto)
+				return
+			}
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				lastErr = ctx.Err()
@@ -614,6 +613,36 @@ func (f *firstByteReader) Read(p []byte) (int, error) {
 		f.first = time.Now()
 	}
 	return n, err
+}
+
+// Errors from send that the attempt loop handles differently from a transport failure.
+var (
+	errBuildRequest = errors.New("failed to build upstream request")
+	errUpstreamAuth = errors.New("upstream auth failed")
+)
+
+// send posts upBody to the provider's native endpoint for target over plain HTTP, signed by the
+// provider's authenticator.
+func (h *Handler) send(ctx context.Context, r *http.Request, prov *provider.Provider, base *url.URL,
+	target protocol.Protocol, translating bool, upBody []byte) (*http.Response, error) {
+	upURL := *base
+	upURL.Path = strings.TrimRight(base.Path, "/") + target.UpstreamPath()
+	// upURL 只由配置里的 provider base URL 加协议固定路径拼成，不含任何客户端输入（客户端只能影响请求体）。
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL.String(), bytes.NewReader(upBody)) // nosemgrep: gosec.G107-1
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errBuildRequest, err)
+	}
+	upReq.ContentLength = int64(len(upBody))
+	copyRequestHeaders(r.Header, upReq.Header, target, translating)
+	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Set("User-Agent", userAgent)
+	if target == protocol.Anthropic && upReq.Header.Get("anthropic-version") == "" {
+		upReq.Header.Set("anthropic-version", defaultAnthropicVers)
+	}
+	if err := prov.Authenticate(ctx, upReq, upBody); err != nil {
+		return nil, fmt.Errorf("%w: %v", errUpstreamAuth, err)
+	}
+	return h.client.Do(upReq)
 }
 
 // copyRequestHeaders forwards the allow-listed client headers. When translating, headers that

@@ -59,6 +59,15 @@ providers:
   #     anthropic:        "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/anthropic/v1"
   #     openai_chat:      "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
   #     openai_responses: "https://vpce-xxxx-yyyy.bedrock-runtime.us-west-2.vpce.amazonaws.com/openai/v1"
+  # 经 SDK InvokeModel / InvokeModelWithResponseStream 调 Bedrock（与基于 AWS SDK 的网关同一条调用路径）：
+  #   bedrock_invoke 只写 bedrock-runtime 主机（或其 VPC Endpoint 专属域名），不带路径；仅 auth: aws_iam 可用
+  #   目标协议 anthropic（Claude）/ openai_chat（GPT）走它；Responses 客户端调 GPT 要在路由上配 providerProtocol: openai_chat
+  #   同一 provider 同时配了原生协议端点时，原生端点优先
+  # bedrock-invoke-usw2:
+  #   auth: aws_iam
+  #   region: us-west-2
+  #   endpoints:
+  #     bedrock_invoke: "https://bedrock-runtime.us-west-2.amazonaws.com"
   openai:
     auth: bearer
     api_key: "secretsmanager://llm-gateway/prod#OPENAI_API_KEY"   # 从 JSON secret 里取一个键
