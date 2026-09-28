@@ -24,7 +24,10 @@ func (f *fakeAPI) GetSecretValue(_ context.Context, in *secretsmanager.GetSecret
 	if !ok {
 		return nil, errors.New("ResourceNotFoundException")
 	}
-	return &secretsmanager.GetSecretValueOutput{SecretString: s, VersionId: aws.String("v1")}, nil
+	return &secretsmanager.GetSecretValueOutput{
+		ARN:          aws.String("arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:" + aws.ToString(in.SecretId) + "-AbCdEf"),
+		SecretString: s, VersionId: aws.String("v1"),
+	}, nil
 }
 
 func newCfg() *config.Config {
@@ -97,18 +100,18 @@ func TestResolve(t *testing.T) {
 
 func TestResolveErrors(t *testing.T) {
 	api := &fakeAPI{secrets: map[string]*string{
-		"json":   aws.String(`{"a":"x","n":1,"empty":" "}`),
+		"json":   aws.String(`{"a":"x","num":1,"blank":" "}`),
 		"plain":  aws.String("not-json"),
 		"binary": nil,
 	}}
 	cases := map[string]string{
-		"secretsmanager://missing":    "get secret",
-		"secretsmanager://json#nokey": "not found",
-		"secretsmanager://json#n":     "not a string",
-		"secretsmanager://json#empty": "empty value",
-		"secretsmanager://plain#k":    "not a JSON object",
-		"secretsmanager://binary":     "no SecretString",
-		"secretsmanager://":           "empty secret id",
+		"secretsmanager://missing":       "get secret",
+		"secretsmanager://json#nokey":    "not found",
+		"secretsmanager://json#num":      "not a string",
+		"secretsmanager://json#blank":    "empty value",
+		"secretsmanager://plain#somekey": "not a JSON object",
+		"secretsmanager://binary":        "no SecretString",
+		"secretsmanager://":              "empty secret id",
 	}
 	for ref, want := range cases {
 		cfg := &config.Config{ControlPlane: config.ControlPlane{Token: ref}}
@@ -118,6 +121,15 @@ func TestResolveErrors(t *testing.T) {
 		}
 		if !strings.HasPrefix(err.Error(), "control_plane.token") {
 			t.Fatalf("%q: error should name the field, got %v", ref, err)
+		}
+		// The configured reference is a secret-typed field: the raw reference and the JSON key
+		// written in the config must not be echoed into the error (it ends up in startup logs).
+		// The secret is identified by the ARN the API returned instead.
+		if strings.Contains(err.Error(), ref) {
+			t.Fatalf("%q: error echoes the configured reference: %v", ref, err)
+		}
+		if _, key, ok := strings.Cut(ref, "#"); ok && key != "" && strings.Contains(err.Error(), key) {
+			t.Fatalf("%q: error echoes configured json key %q: %v", ref, key, err)
 		}
 	}
 }

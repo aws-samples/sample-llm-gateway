@@ -274,13 +274,17 @@ func headerList(h http.Header, name string) []string {
 	return out
 }
 
+// mergeUnique appends b to a, dropping duplicates and keeping first-seen order. No capacity
+// hints: a comes from the request body, so its length is not something to size allocations by.
 func mergeUnique(a, b []string) []string {
-	seen := make(map[string]bool, len(a)+len(b))
-	out := make([]string, 0, len(a)+len(b))
-	for _, s := range append(append([]string{}, a...), b...) {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, s := range list {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
 		}
 	}
 	return out

@@ -48,7 +48,7 @@ HTTP 接口，并且鉴权是 `Authorization: Bearer`、`x-api-key`、AWS SigV4 
 
 两种方式都是启动时读一次，运行中不刷新，所以轮转必然伴随一次滚动重启。控制面 token 的轮转顺序：控制面先同时接受新旧两个
 token，改 secret，重启网关，确认日志 `secret resolved` 的 `version_id` 是新版本且 key-auth 正常，再让控制面废掉旧 token。
-密钥值不进日志，`secret resolved` 只打字段名、secret id、JSON 键和版本号。
+密钥值不进日志，`secret resolved` 只打字段名、Secrets Manager 返回的 `secret_arn` 和版本号；配置里写的引用（secret 名、JSON 键）也不回显。
 
 ### 什么时候必须改代码
 
@@ -213,7 +213,7 @@ stdout，一行一条 JSON。级别由 `server.log_level` 控制。
 
 其他关键日志：
 
-- 启动：`secrets manager resolver ready`、`secret resolved`（每个 `secretsmanager://` 引用一条，带字段名与 `version_id`）、
+- 启动：`secrets manager resolver ready`、`secret resolved`（每个 `secretsmanager://` 引用一条，带字段名、`secret_arn` 与 `version_id`）、
   `aws identity resolved`（每个 aws_iam provider 一条，带 ARN）、`routes loaded`、`gateway listening`
 - 路由：`routes loaded`（版本、模型数，启动和每次变更都打）、`routes poll failed, keeping last snapshot`（沿用旧快照；
   `err` 为 `empty route table rejected, keeping last snapshot` 时是控制面下发了空表被拒收）
@@ -244,7 +244,7 @@ stdout，一行一条 JSON。级别由 `server.log_level` 控制。
 | Bedrock 返回 400 `Access to OpenAI models is not allowed from unsupported countries...` | 调用方出口所在地不受支持 | 只有 GPT 系列失败，Claude 正常 | 把网关部署在受支持的区域；本地开发环境属于此情况 |
 | GPT 模型 400 `Unsupported parameter: max_tokens` | 客户端传了 `max_tokens`，Bedrock 上的 GPT 要 `max_completion_tokens` | 客户端收到的 400 正文来自 Bedrock，明确提到 `max_tokens` | 客户端改字段。网关第一阶段不做转换 |
 | 启动失败 `provider setup failed ... resolve aws credentials` | IRSA 配置不完整：ServiceAccount 缺 role-arn 注解、角色信任策略不正确、OIDC 未启用 | Pod 日志首行 `provider setup failed`，err 含 `resolve aws credentials` | 核对 `eksctl create iamserviceaccount` 输出与 `10-serviceaccount.yaml` |
-| 启动失败 `secret resolution failed` | Secrets Manager 引用取不到：IAM 缺 `GetSecretValue`、secret 名或 JSON 键写错、私网环境没有 secretsmanager VPC Endpoint（表现为超时） | Pod 日志 `secret resolution failed`，err 里带字段名和 secret id；`AccessDeniedException` 是 IAM，`ResourceNotFoundException` 是名字，`context deadline exceeded` 是网络 | 对照 `deploy/eks/secrets-read-policy.json` 与 secret 名；私网看 private-networking.md 的 VPC 资源表 |
+| 启动失败 `secret resolution failed` | Secrets Manager 引用取不到：IAM 缺 `GetSecretValue`、secret 名或 JSON 键写错、私网环境没有 secretsmanager VPC Endpoint（表现为超时） | Pod 日志 `secret resolution failed`，err 里带字段名（如 `providers.openai.api_key`），不回显配置里的 secret 名和 JSON 键，按字段名去配置里对；`AccessDeniedException` 是 IAM，`ResourceNotFoundException` 是名字，`context deadline exceeded` 是网络 | 对照 `deploy/eks/secrets-read-policy.json` 与 secret 名；私网看 private-networking.md 的 VPC 资源表 |
 | 启动失败 `could not load initial routes`（重试 60 秒后退出） | 控制面不可达 | Pod CrashLoopBackOff，日志反复出现 `initial routes load failed, retrying` | 先修控制面连通性 |
 | 计量 `dropped` 增长 | 控制面上报接口持续失败或队列满 | `llmgw_metering_queue_depth`、日志 `usage report failed permanently` | 检查控制面；调大 `queue_size` / `workers` 只能缓冲不能根治 |
 | 计量 token 为 0 但请求 200 | 供应商没返回 usage，或流被客户端提前断开 | 日志 `usage_found: false` | 确认供应商 usage 字段格式；OpenAI 兼容端点是否忽略了 `stream_options` |

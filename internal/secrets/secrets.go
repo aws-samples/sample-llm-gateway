@@ -75,6 +75,7 @@ type Resolver struct {
 
 type fetched struct {
 	value   string
+	arn     string // canonical ARN from the API response; the only secret identity that reaches logs
 	version string
 }
 
@@ -163,15 +164,17 @@ func (r *Resolver) resolveField(ctx context.Context, field string, v *string) er
 	if ref.JSONKey != "" {
 		val, err = jsonKey(f.value, ref.JSONKey)
 		if err != nil {
-			return fmt.Errorf("%s: secret %q: %w", field, ref.SecretID, err)
+			return fmt.Errorf("%s: secret %s: %w", field, f.arn, err)
 		}
 	}
 	val = strings.TrimSpace(val)
 	if val == "" {
-		return fmt.Errorf("%s: secret %q resolved to an empty value", field, ref.SecretID)
+		return fmt.Errorf("%s: secret %s resolved to an empty value", field, f.arn)
 	}
 	*v = val
-	r.log.Info("secret resolved", "field", field, "secret_id", ref.SecretID, "json_key", ref.JSONKey, "version_id", f.version)
+	// Nothing taken from the configured reference (secret id, JSON key) is logged: the field is a
+	// secret-typed config value, and only the API-reported ARN and version identify what resolved.
+	r.log.Info("secret resolved", "field", field, "secret_arn", f.arn, "version_id", f.version)
 	return nil
 }
 
@@ -183,12 +186,12 @@ func (r *Resolver) fetch(ctx context.Context, id string) (fetched, error) {
 	defer cancel()
 	out, err := r.api.GetSecretValue(cctx, &secretsmanager.GetSecretValueInput{SecretId: aws.String(id)})
 	if err != nil {
-		return fetched{}, fmt.Errorf("get secret %q: %w", id, err)
+		return fetched{}, fmt.Errorf("get secret: %w", err)
 	}
 	if out.SecretString == nil {
-		return fetched{}, fmt.Errorf("secret %q has no SecretString (binary secrets are not supported)", id)
+		return fetched{}, fmt.Errorf("secret %s has no SecretString (binary secrets are not supported)", aws.ToString(out.ARN))
 	}
-	f := fetched{value: *out.SecretString, version: aws.ToString(out.VersionId)}
+	f := fetched{value: *out.SecretString, arn: aws.ToString(out.ARN), version: aws.ToString(out.VersionId)}
 	r.cache[id] = f
 	return f, nil
 }
@@ -197,15 +200,15 @@ func (r *Resolver) fetch(ctx context.Context, id string) (fetched, error) {
 func jsonKey(secret, key string) (string, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(secret), &m); err != nil {
-		return "", fmt.Errorf("SecretString is not a JSON object, cannot select key %q", key)
+		return "", errors.New("SecretString is not a JSON object, cannot select a key")
 	}
 	raw, ok := m[key]
 	if !ok {
-		return "", fmt.Errorf("json key %q not found", key)
+		return "", errors.New("json key not found")
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", fmt.Errorf("json key %q is not a string", key)
+		return "", errors.New("json key is not a string")
 	}
 	return s, nil
 }

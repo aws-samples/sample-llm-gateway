@@ -73,7 +73,7 @@
 - 同一个 secret 被多个字段引用只取一次，推荐把一套环境的密钥放进一个 JSON secret，按键引用。
 - 取到的值会去掉首尾空白（避免从文件导入 secret 时带上的换行）。取不到、键不存在、值不是字符串、值为空、
   secret 只有二进制内容，都会启动失败，日志 `secret resolution failed`。
-- 每个引用解析成功打一行 `secret resolved`，带字段名、secret id、JSON 键和 `version_id`，不打印值。
+- 每个引用解析成功打一行 `secret resolved`，带字段名、Secrets Manager 返回的 `secret_arn` 和 `version_id`，不打印值，也不回显配置里写的引用（secret 名、JSON 键）。
 - 只在启动时读取一次。轮转 secret 后 `kubectl rollout restart deployment/llm-gateway -n llm-gateway`，新副本读新值、
   `/readyz` 通过后才接流量。控制面 token 轮转要先让控制面同时接受新旧两个值，再重启网关，再废旧值。
 - IAM：IRSA 角色需要对被引用的 secret 有 `secretsmanager:GetSecretValue`，样例 [deploy/eks/secrets-read-policy.json](../deploy/eks/secrets-read-policy.json)

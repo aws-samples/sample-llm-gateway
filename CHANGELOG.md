@@ -2,6 +2,17 @@
 
 ## 2026-09-28（未发新镜像）
 
+### 清零 GitHub CodeQL 的 6 条 open alert
+
+- `go/clear-text-logging`（3 条，`cmd/gateway/main.go:64` 与 `internal/secrets/secrets.go:174`）：CodeQL 把 `providers.*.api_key` 字段整体视为密钥，
+  `secretsmanager://` 引用解析出的 secret 名和 JSON 键因此也被当作密钥数据。现在 `secret resolved` 日志与解析错误只带字段名、
+  Secrets Manager 返回的 `secret_arn` 和 `version_id`，不再回显配置里写的 secret 名和 JSON 键（`secret_id` / `json_key` 两个日志键删除）。
+  仍能按字段名（如 `providers.openai.api_key`）在配置里定位。文档 configuration.md / operations.md 同步。
+- `go/path-injection`（`tools/recordproxy/main.go:189`）：录制文件名里的请求路径改为只保留 `[A-Za-z0-9._-]`、折叠 `..`、`filepath.IsLocal` 兜底，
+  录制只能落在 `-out` 目录下。开发工具，不进镜像。
+- `go/allocation-size-overflow`（2 条，`internal/provider/bedrock_invoke.go:278-279`）：`mergeUnique` 不再用请求体里 `anthropic_beta` 数组长度做分配容量提示，行为不变。
+- 本地用 CodeQL CLI 2.27.0 + go-queries 1.6.10 复核三条查询：修前 6 条 → 修后 0 条。
+
 ### 路由样例与冒烟覆盖 GPT-6 三档
 
 - mock 控制面内置路由与 `deploy/k8s/20-mock-controlplane.yaml` 新增 `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna`（东京 `bedrock`）及对应 `-us` 跨账号路由，

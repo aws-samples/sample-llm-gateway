@@ -296,10 +296,20 @@ func validUserID(s string) bool {
 	return true
 }
 
+// sanitize turns a request path into one file-name component: anything outside
+// [A-Za-z0-9._-] becomes '_' and ".." sequences are collapsed, so the recording can only ever
+// land directly under -out.
 func sanitize(p string) string {
 	p = strings.Trim(p, "/")
-	p = strings.ReplaceAll(p, "/", "_")
-	if p == "" {
+	p = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, p)
+	p = strings.ReplaceAll(p, "..", "_")
+	if p == "" || !filepath.IsLocal(p) {
 		p = "root"
 	}
 	return p
