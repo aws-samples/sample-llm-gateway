@@ -371,6 +371,7 @@ This README is in English. Detailed guides, the load-test README, changelog, and
 | [Control plane contract](docs/control-plane.md) | Routes, authorization, usage reporting, and error mappings. |
 | [Operations](docs/operations.md) | Adding models and providers, upgrades, metrics, and troubleshooting. |
 | [Private networking](docs/private-networking.md) | EKS, IRSA, VPC endpoints, cross-Region, and cross-account setup. |
+| [Cross-account private networking, measured](docs/cross-account-private-networking.md) | Two-account lab (gateway in Tokyo, Bedrock in us-west-2, peering, no internet egress): how the two STS hops, VPC endpoint private DNS and SigV4 regions interact, eight STS configurations compared, pass-through vs SDK InvokeModel, troubleshooting table. |
 | [Protocol translation design](docs/protocol-translation-design.md) | IR architecture, field mappings for the six directions, decisions, recorded-traffic findings, and test approach. |
 | [Protocol translation report](docs/protocol-translation-report.md) | Implementation timeline, test method, issues found on real traffic and how they were fixed, end-to-end results with Claude Code, Codex, and the OpenAI SDK, and reproduction steps. |
 | [Robustness report](docs/robustness-report.md) | Fault-injection scenarios and test results. |
