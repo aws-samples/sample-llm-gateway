@@ -69,6 +69,7 @@ VPCE 和 IAM 角色。
 | `60-netprobe.sh` / `tools/netprobe` | 私网内解析域名、试连 URL 的探针（公共镜像在无出口 VPC 拉不下来，所以自己打一个） |
 | `70-sts-experiments.sh` / `tools/stsprobe` | STS 两跳实验（§3） |
 | `75-gateway-no-sts-region.sh` | 真网关漏配 `sts_region` 的对照（§3.5） |
+| `76-gateway-no-private-dns.sh` | 真网关在 STS VPCE 无私有 DNS 形态下，有无 `AWS_ENDPOINT_URL_STS` 的对照（§3.5 G1/G2） |
 | `80-transport-compare.sh` | 透传 vs InvokeModel 对比（§4） |
 | `90-teardown.sh` | 按依赖顺序拆除（默认 dry-run，`CONFIRM=yes` 才删） |
 
@@ -222,8 +223,12 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 `internal/provider/sigv4.go`：`sts_region` 单独成字段，传给 `LoadDefaultConfig(WithRegion(stsRegion))`，跳 1 和跳 2 的 client 都从这份 config
 继承区域；Bedrock 签名区域用 `region` 字段另配。**前提是 STS VPCE 开了私有 DNS**，公网域名解析进内网，才不需要任何端点 URL。
 
-私有 DNS 没开时（C11）本网关同样连不上 STS。此时需要在 Deployment 里加 `AWS_ENDPOINT_URL_STS=https://<sts-vpce-dns>`（C12 用与网关相同的
-SDK 构造方式验证通过；**网关二进制本身在该形态下未实测**，`sigv4.go` 没有读这个变量的代码，依赖 SDK 在 `LoadDefaultConfig` 里自动读取）。
+私有 DNS 没开时本网关同样连不上 STS。用**网关二进制本身**在该形态下实测（`76-gateway-no-private-dns.sh`）：
+
+- G1：出厂配置（`sts_region: ap-northeast-1`），STS VPCE 关私有 DNS → 20 秒后 `provider setup failed … resolve aws credentials: context deadline exceeded`，进程退出。
+- G2：同上 + Deployment env `AWS_ENDPOINT_URL_STS=https://<sts-vpce-dns>` → 1 秒内全部 provider `aws identity resolved`，跨账号身份为 B 的 `assumed-role/llmgw-bedrock-xacct`，正常监听。
+
+`sigv4.go` 没有读这个变量的代码，是 SDK 的 `LoadDefaultConfig` 自动读取并应用到它创建的所有 STS client（含 IRSA 内建的那个）。
 本网关在这一点上的优势只有一条：区域已显式钉住，加了端点变量不会出 403。
 
 回退链是 `sts_region` → `AWS_REGION` → `AWS_DEFAULT_REGION` → `region`。实验 75 用真网关镜像去掉 `sts_region`：
@@ -244,7 +249,7 @@ SDK 构造方式验证通过；**网关二进制本身在该形态下未实测**
 | 维度 | 客户做法（SDK 网关） | 本网关 | 区别的后果 | 建议 |
 |---|---|---|---|---|
 | 到 Bedrock 的传输 | AWS SDK `InvokeModel` / `InvokeModelWithResponseStream`：改写 body、解二进制 event stream 再组 SSE | 透传 Bedrock 的协议兼容端点：只改 `model`，自己 SigV4，响应字节原样回 | 性能、计量无差（T3）；但 InvokeModel 不收 Responses 协议（T1）、端点错配时报错误导（T2）、新字段依赖改写覆盖 | **可不改**。架构能跑；下面三条单独处理 |
-| 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS`（Odin 转述） | `sts_region` 字段显式钉区域；依赖 STS VPCE 私有 DNS，无私有 DNS 时同样需要 `AWS_ENDPOINT_URL_STS`（C11/C12） | 客户的修法**只在 STS 的 region 等于东京时成立**。代码不设 region 时，这个"东京"来自 EKS webhook 注入的 `AWS_REGION`（C9 通）；`AWS_REGION` 换成别的区域即 403（C10）；代码显式设 us-west-2 则一直 403（C2）。客户属于哪种**未知**。两种做法的实质差别只在区域是否显式钉住 | **必须改**：STS 的 region 显式钉到 VPCE 区域，不依赖注入值；开私有 DNS 或保留环境变量 |
+| 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS`（Odin 转述） | `sts_region` 字段显式钉区域；依赖 STS VPCE 私有 DNS，无私有 DNS 时同样需要 `AWS_ENDPOINT_URL_STS`（网关二进制实测 G1/G2） | 客户的修法**只在 STS 的 region 等于东京时成立**。代码不设 region 时，这个"东京"来自 EKS webhook 注入的 `AWS_REGION`（C9 通）；`AWS_REGION` 换成别的区域即 403（C10）；代码显式设 us-west-2 则一直 403（C2）。客户属于哪种**未知**。两种做法的实质差别只在区域是否显式钉住 | **必须改**：STS 的 region 显式钉到 VPCE 区域，不依赖注入值；开私有 DNS 或保留环境变量 |
 | 多协议 / 协议转换 | **实测**：InvokeModel 只接 Anthropic Messages 和 OpenAI Chat 两种 body，Responses body 直接 400 `missing field 'messages'`（T1b）；本网关的 InvokeModel 路径据此在入口拒掉（T1）。**推断**：客户走同一 API 受同一限制，是否另做了转换未知 | 三种协议原生直通；路由字段 `providerProtocol` 六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 若客户未做转换，Codex 这类只发 Responses 的客户端在他们网关上无法使用 | **建议补**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
 | 计量来源 | **推断**：usage 只能从 SDK 解出的 event stream 块里取 | 从上游原始字节解析，与透传该协议时一致 | 本网关两条路（透传 / `bedrock_invoke`）实测 usage 完全相同（T3）；客户那边是否所有协议、流式/非流式都取到了 usage，**未验证** | 请客户核对计量是否覆盖 Claude/GPT × 流式/非流式四种组合 |
 | 上游错误可读性 | SDK 把非 JSON 响应包装成 `deserialization failed … '<'`（T2 实测，客户现场同款报错见 operations.md） | 透传上游原文 `<UnknownOperationException/>`（T2） | 端点配错时客户网关的报错看不出是端点错，排障慢 | 排障表 §5 给客户 |
@@ -329,8 +334,8 @@ InvokeModel 发给 Bedrock：
 
 - Odin 10/12 文档里的 `AWS_ENDPOINT_URL_STS` 建议正确，但要补一句"region 也要是 VPCE 所在区域"（C2/C6 的 403）。
 - 实验 75 显示本网关在 EKS 上即使漏配 `sts_region` 也能靠 webhook 注入的 `AWS_REGION` 兜住；要不要把这一点写进 configuration.md 的 `sts_region` 说明？
-- C11 显示本网关的 STS 做法依赖 STS VPCE 私有 DNS；private-networking.md 和 configuration.md 目前没有写"私有 DNS 未开时要加 `AWS_ENDPOINT_URL_STS`"，
-  建议补一句，并用网关二进制在该形态下实测一次（本次只用等价构造的探针验证了）。
+- C11/G1 显示本网关的 STS 做法依赖 STS VPCE 私有 DNS；G2 用网关二进制验证了私有 DNS 未开时在 Deployment 加 `AWS_ENDPOINT_URL_STS` 即可，无需改代码。
+  private-networking.md 和 configuration.md 目前没有写这一点，建议在 `sts_region` 说明旁补一句。
 - 本次 B 账号的跨账号角色权限里含 `arn:aws:bedrock:*:*:project/default`，所以跨账号 `/v1/responses` 实测 200——这是第一次在跨账号路径上
   验证到 Responses 通。你 9/3 PoC 的对端账号（别人管理的那个 Bedrock 账号）角色缺这条，导致 Messages/Chat 200 而 Responses 401
   （private-networking.md §六、CHANGELOG 9/28 都记过）。客户的 B 账号通常也是另一个团队管，建议在最终文档里单列提醒。
