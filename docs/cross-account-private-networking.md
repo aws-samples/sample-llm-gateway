@@ -233,7 +233,7 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 |---|---|---|---|---|
 | 到 Bedrock 的传输 | AWS SDK `InvokeModel` / `InvokeModelWithResponseStream`：改写 body、解二进制 event stream 再组 SSE | 透传 Bedrock 的协议兼容端点：只改 `model`，自己 SigV4，响应字节原样回 | 性能、计量无差（T3）；但 InvokeModel 不收 Responses 协议（T1）、端点错配时报错误导（T2）、新字段依赖改写覆盖 | **可不改**。架构能跑；下面三条单独处理 |
 | 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS`（Odin 转述） | `sts_region` 字段钉区域 + STS VPCE 私有 DNS，两跳自动走内网；回退链兜底 | 客户的修法**只在 STS 的 region 等于东京时成立**。代码不设 region 时，这个"东京"来自 EKS webhook 注入的 `AWS_REGION`（C9 通）；`AWS_REGION` 换成别的区域即 403（C10）；代码显式设 us-west-2 则一直 403（C2）。客户属于哪种**未知** | **必须改**：STS 的 region 显式钉到 VPCE 区域，不依赖注入值；开私有 DNS 或保留环境变量 |
-| 多协议 / 协议转换 | **推断**：走 InvokeModel 就只能接 Anthropic Messages 和 OpenAI Chat 两种 body（T1 在本网关的 InvokeModel 路径上实测 Responses → 502）；客户是否另做了转换未知 | 三种协议原生直通；路由字段 `providerProtocol` 六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 若客户未做转换，Codex 这类只发 Responses 的客户端在他们网关上无法使用 | **建议补**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
+| 多协议 / 协议转换 | **实测**：InvokeModel 只接 Anthropic Messages 和 OpenAI Chat 两种 body，Responses body 直接 400 `missing field 'messages'`（T1b）；本网关的 InvokeModel 路径据此在入口拒掉（T1）。**推断**：客户走同一 API 受同一限制，是否另做了转换未知 | 三种协议原生直通；路由字段 `providerProtocol` 六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 若客户未做转换，Codex 这类只发 Responses 的客户端在他们网关上无法使用 | **建议补**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
 | 计量来源 | **推断**：usage 只能从 SDK 解出的 event stream 块里取 | 从上游原始字节解析，与透传该协议时一致 | 本网关两条路（透传 / `bedrock_invoke`）实测 usage 完全相同（T3）；客户那边是否所有协议、流式/非流式都取到了 usage，**未验证** | 请客户核对计量是否覆盖 Claude/GPT × 流式/非流式四种组合 |
 | 上游错误可读性 | SDK 把非 JSON 响应包装成 `deserialization failed … '<'`（T2 实测，客户现场同款报错见 operations.md） | 透传上游原文 `<UnknownOperationException/>`（T2） | 端点配错时客户网关的报错看不出是端点错，排障慢 | 排障表 §5 给客户 |
 | 配置模型 | SDK 默认一个 region 同时决定 STS 地址、STS 签名区域、Bedrock 地址、Bedrock 签名区域；要分开只能靠环境变量 / 逐 client 覆盖 | `region` / `sts_region` / `endpoints` 三个字段分管 Bedrock 签名区域、STS 区域、地址 | 跨区域跨账号时四件事必须分别对齐，少一个就是 C1/C2/C5 之一 | 文档化这几个旋钮，客户按表核对自己的代码 |
@@ -272,7 +272,7 @@ InvokeModel 发给 Bedrock：
 
 | 对比项 | 透传 | InvokeModel | 说明 |
 |---|---|---|---|
-| **OpenAI Responses 协议**（Codex 用） | `/v1/responses` 200 | **502 `does not serve openai_responses`** | InvokeModel 不收 Responses body。SDK 网关要服务 Codex 类客户端，必须先转成 Chat 格式 |
+| **OpenAI Responses 协议**（Codex 用） | `/v1/responses` 200 | **502 `does not serve openai_responses`**（本网关在 `CanInvoke` 处主动拒，请求未出网关） | 底层原因（T1b，直接用 CLI 把 Responses body 发给 B 的 InvokeModel）：**400 `ValidationException … missing field 'messages'`**——InvokeModel 按 Chat Completions 结构反序列化 GPT 请求体。SDK 网关要服务 Codex 类客户端，必须先转成 Chat 格式 |
 | **端点配错时的报错**（指到可达但不是 bedrock-runtime 的私网主机） | 404 `<UnknownOperationException/>`，上游原文 | 404 `deserialization failed … invalid character '<' looking for beginning of value` | SDK 硬按 JSON 解析 XML；**从报错看不出是端点错**。Odin operations.md 排障表那一行的实证 |
 | 流式 TTFT p50（各 6 次） | Claude 1094ms / GPT 582ms | Claude 1076ms / GPT 549ms | 差 20–30ms，噪声级 |
 | usage 计量 | 16/10、13/9 | 完全相同 | event stream 还原为 SSE 后计量路径复用 |
@@ -300,7 +300,7 @@ InvokeModel 发给 Bedrock：
 | `AssumeRole … 403 SignatureDoesNotMatch: Credential should be scoped to a valid region` | 端点改到东京但 region 仍是别的区域 | C2/C6 | 用于 STS 的 region 改为 VPCE 区域 |
 | `InvokeModel … Post "https://bedrock-runtime.us-west-2…": context deadline exceeded`（凭证已成功） | 跨 VPC 用了公网域名，私有 DNS 不跨 peering | C5 | 写 VPCE 专属域名 |
 | `deserialization failed … invalid character '<'` | SDK 的 Bedrock 端点指到了不是 bedrock-runtime 的主机 | T2 | 端点改为 `bedrock-runtime.<region>…` 或其 VPCE 专属域名 |
-| `does not serve openai_responses` | Responses body 走到了 InvokeModel 路径 | T1 | 路由加 `providerProtocol: openai_chat` |
+| `does not serve openai_responses`（本网关）/ `ValidationException … missing field 'messages'`（SDK 网关直发） | Responses body 走到了 InvokeModel 路径 | T1 / T1b | 路由加 `providerProtocol: openai_chat`；SDK 网关需先把 Responses 转成 Chat |
 | 网关启动 `provider setup failed … resolve aws credentials: context deadline exceeded` | 本网关漏配 `sts_region` 且 `AWS_REGION` 不是 VPCE 区域 | 75 | 补 `sts_region` |
 | Pod 起不来 / 拉不到镜像 | 缺 ecr.api / ecr.dkr / s3 / ec2 / eks / eks-auth 端点 | 建环境时 | 对照 §1.1 端点清单 |
 

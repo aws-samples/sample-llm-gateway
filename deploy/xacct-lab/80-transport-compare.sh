@@ -57,6 +57,8 @@ say "# InvokeModel accepts Anthropic Messages and OpenAI Chat bodies only; a Res
 say "  native  /v1/responses gpt-5.6-sol-us        -> $(req /v1/responses "$(printf "$R" gpt-5.6-sol-us)")"; say "          $(head -c 160 /tmp/tc.json)"
 say "  invoke  /v1/responses gpt-5.6-sol-us-invoke -> $(req /v1/responses "$(printf "$R" gpt-5.6-sol-us-invoke)")"; say "          $(head -c 300 /tmp/tc.json)"
 say "  (fix for Codex-style clients on the invoke path: route with providerProtocol=openai_chat)"
+say "# T1b: the underlying reason — a Responses body sent straight to InvokeModel in account B:"
+awsB bedrock-runtime invoke-model --model-id us.openai.gpt-5.6-sol --body '{"input":"Say hi in 3 words.","max_output_tokens":50,"store":false}' --cli-binary-format raw-in-base64-out /tmp/tc-t1b.json 2>&1 | grep -o 'An error occurred.*' | cut -c1-260 | sed 's/^/  /' | tee -a "$LOG"
 
 say; say "################ T2  error readability: provider endpoint points at a reachable private host that is not bedrock-runtime"
 say "  native  wrong-native -> $(req /v1/messages "$(printf "$A" wrong-native)")"; say "          $(head -c 400 /tmp/tc.json | tr '\n' ' ')"
