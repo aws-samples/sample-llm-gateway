@@ -189,8 +189,8 @@ STS VPCE 在东京、私有 DNS 开（C1–C6、C9–C10）或临时关掉（C7�
 | **C8** | **客户修法**：+ 环境变量 | ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | **✓** |
 | C9 | 客户修法，**代码不设 region**，由 SDK 读 EKS webhook 注入的 `AWS_REGION` | （注入）ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | ✓ |
 | C10 | 同 C9，`AWS_REGION` 改为 us-west-2 | （env）us-west-2 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | **403 SignatureDoesNotMatch** | — | ✗ |
-| C11 | **本网关做法放到客户环境形态**：region 钉东京、不配端点，但 STS VPCE **无私有 DNS** | ap-northeast-1 | — | — | `sts.ap-northeast-1` → **8s 超时** | 未到 | — | ✗ |
-| C12 | C11 + `AWS_ENDPOINT_URL_STS` | ap-northeast-1 | — | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | ✓ |
+| C11 | **本网关做法放到客户环境形态**：region 钉东京、不配端点，但 STS VPCE **无私有 DNS**（探针；网关镜像对照见 §3.5 G1） | ap-northeast-1 | — | — | `sts.ap-northeast-1` → **8s 超时** | 未到 | — | ✗ |
+| C12 | C11 + `AWS_ENDPOINT_URL_STS`（探针；网关镜像对照见 §3.5 G2） | ap-northeast-1 | — | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | ✓ |
 
 C7 的原始报错。与 Odin 10/12 记进 operations.md 的客户现场报错是同一形状（他记的末尾是 `connection reset by peer（或超时）`，
 本环境的 NetworkPolicy 丢包所以表现为超时）：
@@ -223,7 +223,8 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 `internal/provider/sigv4.go`：`sts_region` 单独成字段，传给 `LoadDefaultConfig(WithRegion(stsRegion))`，跳 1 和跳 2 的 client 都从这份 config
 继承区域；Bedrock 签名区域用 `region` 字段另配。**前提是 STS VPCE 开了私有 DNS**，公网域名解析进内网，才不需要任何端点 URL。
 
-私有 DNS 没开时本网关同样连不上 STS。用**网关二进制本身**在该形态下实测（`76-gateway-no-private-dns.sh`）：
+私有 DNS 没开时本网关同样连不上 STS。§3.3 的 C11/C12 是用探针（`tools/stsprobe`，SDK 标准写法）得出的；网关的 `sigv4.go` 有自己的凭证链
+构造方式，探针结论不能直接迁移，所以用**网关镜像本身**在同一形态下重做一遍（`76-gateway-no-private-dns.sh`），结果与 C11/C12 一致：
 
 - G1：出厂配置（`sts_region: ap-northeast-1`），STS VPCE 关私有 DNS → 20 秒后 `provider setup failed … resolve aws credentials: context deadline exceeded`，进程退出。
 - G2：同上 + Deployment env `AWS_ENDPOINT_URL_STS=https://<sts-vpce-dns>` → 1 秒内全部 provider `aws identity resolved`，跨账号身份为 B 的 `assumed-role/llmgw-bedrock-xacct`，正常监听。
