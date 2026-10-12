@@ -90,6 +90,24 @@ if want C7 "${ALL[@]}" || want C8 "${ALL[@]}"; then
   until [ "$(awsA ec2 describe-vpc-endpoints --vpc-endpoint-ids "$A_VPCE_STS" --query 'VpcEndpoints[0].PrivateDnsEnabled' --output text)" = True ]; do sleep 5; done
 fi
 
+# C11/C12 — the gateway's own approach (region pinned to Tokyo, NO endpoint override) in the
+#      customer's environment shape, i.e. STS VPCE WITHOUT private DNS. C11 shows the approach
+#      depends on private DNS; C12 shows AWS_ENDPOINT_URL_STS is the fallback the gateway also needs
+#      there (the gateway reads it through LoadDefaultConfig like any SDK program).
+if want C11 "${ALL[@]}" || want C12 "${ALL[@]}"; then
+  echo; echo "== disabling private DNS on the Tokyo STS endpoint for C11/C12"
+  awsA ec2 modify-vpc-endpoint --vpc-endpoint-id "$A_VPCE_STS" --no-private-dns-enabled >/dev/null
+  until [ "$(awsA ec2 describe-vpc-endpoints --vpc-endpoint-ids "$A_VPCE_STS" --query 'VpcEndpoints[0].State' --output text)" = available ]; do sleep 5; done
+  sleep 75
+  want C11 "${ALL[@]}" && run "C11 gateway approach (sts_region=Tokyo, no endpoint) but STS VPCE WITHOUT private DNS" "" \
+    -sts-region "$REGION_A" "${COMMON[@]}"
+  want C12 "${ALL[@]}" && run "C12 same + AWS_ENDPOINT_URL_STS (what the gateway would also need there)" "AWS_ENDPOINT_URL_STS=https://$STS_VPCE_DNS" \
+    -sts-region "$REGION_A" "${COMMON[@]}"
+  echo; echo "== re-enabling private DNS on the Tokyo STS endpoint"
+  awsA ec2 modify-vpc-endpoint --vpc-endpoint-id "$A_VPCE_STS" --private-dns-enabled >/dev/null
+  until [ "$(awsA ec2 describe-vpc-endpoints --vpc-endpoint-ids "$A_VPCE_STS" --query 'VpcEndpoints[0].PrivateDnsEnabled' --output text)" = True ]; do sleep 5; done
+fi
+
 # C9/C10 — where does the customer's "region=Tokyo" actually come from? The customer fix
 #      (AWS_ENDPOINT_URL_STS) works only if the SDK region is Tokyo (C2 vs C8). With no region set in
 #      code, the SDK reads AWS_REGION — which on EKS the pod-identity webhook injects as the CLUSTER
