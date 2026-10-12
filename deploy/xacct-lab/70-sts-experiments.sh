@@ -90,4 +90,14 @@ if want C7 "${ALL[@]}" || want C8 "${ALL[@]}"; then
   until [ "$(awsA ec2 describe-vpc-endpoints --vpc-endpoint-ids "$A_VPCE_STS" --query 'VpcEndpoints[0].PrivateDnsEnabled' --output text)" = True ]; do sleep 5; done
 fi
 
+# C9/C10 — where does the customer's "region=Tokyo" actually come from? The customer fix
+#      (AWS_ENDPOINT_URL_STS) works only if the SDK region is Tokyo (C2 vs C8). With no region set in
+#      code, the SDK reads AWS_REGION — which on EKS the pod-identity webhook injects as the CLUSTER
+#      region. C9: rely on that injection. C10: same code, AWS_REGION overridden to us-west-2 (what a
+#      deployment in another region, or an explicit env, would look like).
+want C9 "${ALL[@]}" && run "C9 customer-fixed, NO region in code: SDK reads webhook-injected AWS_REGION" "AWS_ENDPOINT_URL_STS=https://$STS_VPCE_DNS" \
+  -sts-region "" -sts-base "https://$STS_VPCE_DNS" "${COMMON[@]}"
+want C10 "${ALL[@]}" && run "C10 same code, AWS_REGION/AWS_DEFAULT_REGION=us-west-2" "AWS_ENDPOINT_URL_STS=https://$STS_VPCE_DNS AWS_REGION=$REGION_B AWS_DEFAULT_REGION=$REGION_B" \
+  -sts-region "" -sts-base "https://$STS_VPCE_DNS" "${COMMON[@]}"
+
 echo; echo "log: $OUT/sts-experiments.log"

@@ -53,7 +53,7 @@ func short(s string) string {
 }
 
 func main() {
-	stsRegion := flag.String("sts-region", "us-west-2", "region for LoadDefaultConfig (drives hop 1 and hop 2 unless -sts-base is set)")
+	stsRegion := flag.String("sts-region", "us-west-2", "region for LoadDefaultConfig (drives hop 1 and hop 2 unless -sts-base is set); \"\" = do not set, let the SDK read AWS_REGION / AWS_DEFAULT_REGION")
 	stsBase := flag.String("sts-base", "", "BaseEndpoint for the self-built STS client only (hop 2)")
 	roleARN := flag.String("role", "", "cross-account role to assume (hop 2)")
 	brRegion := flag.String("bedrock-region", "us-west-2", "Bedrock signing region")
@@ -62,18 +62,24 @@ func main() {
 	timeout := flag.Duration("timeout", 8*time.Second, "HTTP timeout per attempt")
 	flag.Parse()
 
-	fmt.Printf("stsprobe: sts-region=%s sts-base=%q AWS_ENDPOINT_URL_STS=%q role=%s\n", *stsRegion, *stsBase, os.Getenv("AWS_ENDPOINT_URL_STS"), *roleARN)
+	fmt.Printf("stsprobe: sts-region=%q sts-base=%q AWS_ENDPOINT_URL_STS=%q AWS_REGION=%q AWS_DEFAULT_REGION=%q role=%s\n",
+		*stsRegion, *stsBase, os.Getenv("AWS_ENDPOINT_URL_STS"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), *roleARN)
 	hc := &http.Client{Timeout: *timeout, Transport: logRT{http.DefaultTransport}}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// Hop 1 lives inside here: with AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE set by IRSA, the
 	// default chain creates its own STS client and calls AssumeRoleWithWebIdentity lazily.
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(*stsRegion), awsconfig.WithHTTPClient(hc),
-		awsconfig.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} }))
+	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithHTTPClient(hc),
+		awsconfig.WithRetryer(func() aws.Retryer { return aws.NopRetryer{} })}
+	if *stsRegion != "" {
+		opts = append(opts, awsconfig.WithRegion(*stsRegion))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		fail("LoadDefaultConfig", err)
 	}
+	fmt.Printf("  effective SDK region: %q\n", cfg.Region)
 
 	// Hop 2: the program's own STS client. -sts-base is what a developer typically sets when told
 	// "point STS at the VPC endpoint" — and it does not reach the client from hop 1.

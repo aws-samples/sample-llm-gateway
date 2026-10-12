@@ -172,7 +172,7 @@ B 账号临时凭证（角色 llmgw-bedrock-xacct）→ 签 Bedrock 请求
 | `-sts-base`（= 自建 client 的 `BaseEndpoint`） | **只影响跳 2** |
 | 环境变量 `AWS_ENDPOINT_URL_STS` | 进程内所有 STS client，**两跳都影响**；只改地址，不改签名区域 |
 
-### 3.3 八组结果
+### 3.3 十组结果
 
 STS VPCE 在东京、私有 DNS 开（C1–C6）或临时关掉（C7–C8，模拟客户环境）：
 
@@ -185,6 +185,8 @@ STS VPCE 在东京、私有 DNS 开（C1–C6）或临时关掉（C7–C8，模�
 | C5 | Bedrock 写公网域名 | ap-northeast-1 | — | — | 200 | 200 | `bedrock-runtime.us-west-2` 公网 → **8s 超时** | ✗ |
 | C7 | **客户真实形态**：STS VPCE 无私有 DNS，只设 BaseEndpoint | ap-northeast-1 | 东京 VPCE | — | `sts.ap-northeast-1` → **公网 IP** → 8s 超时 | 未到 | — | ✗ |
 | **C8** | **客户修法**：+ 环境变量 | ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | **✓** |
+| C9 | 客户修法，**代码不设 region**，由 SDK 读 EKS webhook 注入的 `AWS_REGION` | （注入）ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | ✓ |
+| C10 | 同 C9，`AWS_REGION` 改为 us-west-2 | （env）us-west-2 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | **403 SignatureDoesNotMatch** | — | ✗ |
 
 C7 的原始报错，和客户现场一致（Odin 10/12 记进 operations.md 的那一行）：
 
@@ -203,7 +205,8 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
    要么给 STS VPCE 开私有 DNS 让公网域名直接解析到内网（此时什么端点都不用配）。
 2. **端点覆盖不改签名区域。** C2/C6：`AWS_ENDPOINT_URL_STS` 把请求送到了东京 VPCE，但 SDK region 还是 us-west-2，签名区域错，东京 STS 回 403。
    跳 1 不签名所以躲过了，跳 2 一签就暴露。**用于 STS 的 region 必须是 STS VPCE 所在区域**，Bedrock 的 region 单独配。
-   这条 Odin 的文档没写；客户上周没撞到大概是因为 Pod 的 `AWS_REGION` 恰好被 EKS webhook 注成了东京。
+   这条 Odin 的文档没写。C9/C10 进一步说明：代码不设 region 时，SDK 读的是 EKS Pod 身份 webhook 注入的 `AWS_REGION`（= 集群区域），
+   在东京集群上恰好是对的；同一份代码把 `AWS_REGION` 改成 us-west-2 立刻 403。客户的修法如果是靠这个注入值，就是在靠巧合。
 3. **Bedrock 跨 VPC 必须用专属域名**（C5），与 §2.3 一致。
 
 ### 3.5 本网关为什么没踩
@@ -229,12 +232,14 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 | 维度 | 客户做法（SDK 网关） | 本网关 | 区别的后果 | 建议 |
 |---|---|---|---|---|
 | 到 Bedrock 的传输 | AWS SDK `InvokeModel` / `InvokeModelWithResponseStream`：改写 body、解二进制 event stream 再组 SSE | 透传 Bedrock 的协议兼容端点：只改 `model`，自己 SigV4，响应字节原样回 | 性能、计量无差（T3）；但 InvokeModel 不收 Responses 协议（T1）、端点错配时报错误导（T2）、新字段依赖改写覆盖 | **可不改**。架构能跑；下面三条单独处理 |
-| 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS` | `sts_region` 字段钉区域 + STS VPCE 私有 DNS，两跳自动走内网；回退链兜底 | 客户当前能跑是因为 Pod 的 `AWS_REGION` 恰好是东京；换区域部署或没开私有 DNS 就再卡（C1/C2/C7） | **必须改**：STS 的 region 显式钉到 VPCE 区域；开私有 DNS 或保留环境变量 |
-| 多协议 / 协议转换 | 推断只接 Chat（InvokeModel 的限制）；Responses 客户端无法服务 | 三种协议原生直通；路由字段 `providerProtocol` 可六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 有 Codex 类用户时客户网关会 400/502 | **建议改**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
-| 计量来源 | 从 SDK 解出的 event stream 里取 usage（推断） | 从上游原始字节解析，与透传该协议时一致 | 本网关的 `bedrock_invoke` 把 event stream 还原成 SSE 后复用同一计量代码，实测两条路 usage 相同 | 核对客户计量是否覆盖所有协议的 usage 字段 |
-| 上游错误 | SDK 包装后的错误文本（`deserialization failed … '<'`） | 透传上游原文（`<UnknownOperationException/>`） | 排障时间 | 排障表 §5 给客户 |
-| 配置模型 | 一个 region 决定一切，靠环境变量打补丁 | `region` / `sts_region` / `endpoints` 三个字段分管签名区域、STS 区域、地址 | 跨区域跨账号时三件事必须分别对齐（§3.4） | 文档化三个旋钮 |
+| 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS`（Odin 转述） | `sts_region` 字段钉区域 + STS VPCE 私有 DNS，两跳自动走内网；回退链兜底 | 客户的修法**只在 STS 的 region 等于东京时成立**。代码不设 region 时，这个"东京"来自 EKS webhook 注入的 `AWS_REGION`（C9 通）；`AWS_REGION` 换成别的区域即 403（C10）；代码显式设 us-west-2 则一直 403（C2）。客户属于哪种**未知** | **必须改**：STS 的 region 显式钉到 VPCE 区域，不依赖注入值；开私有 DNS 或保留环境变量 |
+| 多协议 / 协议转换 | **推断**：走 InvokeModel 就只能接 Anthropic Messages 和 OpenAI Chat 两种 body（T1 在本网关的 InvokeModel 路径上实测 Responses → 502）；客户是否另做了转换未知 | 三种协议原生直通；路由字段 `providerProtocol` 六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 若客户未做转换，Codex 这类只发 Responses 的客户端在他们网关上无法使用 | **建议补**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
+| 计量来源 | **推断**：usage 只能从 SDK 解出的 event stream 块里取 | 从上游原始字节解析，与透传该协议时一致 | 本网关两条路（透传 / `bedrock_invoke`）实测 usage 完全相同（T3）；客户那边是否所有协议、流式/非流式都取到了 usage，**未验证** | 请客户核对计量是否覆盖 Claude/GPT × 流式/非流式四种组合 |
+| 上游错误可读性 | SDK 把非 JSON 响应包装成 `deserialization failed … '<'`（T2 实测，客户现场同款报错见 operations.md） | 透传上游原文 `<UnknownOperationException/>`（T2） | 端点配错时客户网关的报错看不出是端点错，排障慢 | 排障表 §5 给客户 |
+| 配置模型 | SDK 默认一个 region 同时决定 STS 地址、STS 签名区域、Bedrock 地址、Bedrock 签名区域；要分开只能靠环境变量 / 逐 client 覆盖 | `region` / `sts_region` / `endpoints` 三个字段分管 Bedrock 签名区域、STS 区域、地址 | 跨区域跨账号时四件事必须分别对齐，少一个就是 C1/C2/C5 之一 | 文档化这几个旋钮，客户按表核对自己的代码 |
 | 跨账号角色权限 | 未知 | 含 `project/default` | 缺它则 Responses 跨账号 401，Messages/Chat 正常（9/3 PoC 对端就是这样） | 提醒客户 B 账号角色加 `arn:aws:bedrock:*:*:project/default` |
+
+证据等级：**实测** = 本环境跑出来的（有实验编号）；**推断** = 从 InvokeModel API 的性质或 Odin 的转述推出，客户实际代码可能不同，请 Odin 核对。
 
 一句话给 Odin：**传输方式不必推翻，STS 配法必须改，协议覆盖建议补。** 展开见 §4.3。
 
