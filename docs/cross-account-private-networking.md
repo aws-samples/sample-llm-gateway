@@ -33,7 +33,7 @@ A 账号 · 东京 ap-northeast-1 · VPC 10.2.0.0/16 · 无 IGW / 无 NAT       
 │ 网关端点：s3                                              │     │   权限：InvokeModel* 于 foundation-model/*、   │
 │                                                          │     │         inference-profile/*、project/default  │
 │ 路由：10.1.0.0/16 → pcx                                   │     │ 路由：10.2.0.0/16 → pcx                        │
-│ NetworkPolicy：Pod 出向只放 10.0.0.0/8:443/53 与 Service CIDR│     │ 没有任何计算资源                               │
+│ NetworkPolicy：Pod 出向只放 10/8 的 443/9090/53 与 Service CIDR│   │ 没有任何计算资源                               │
 └──────────────────────────────────────────────────────────┘     └──────────────────────────────────────────────┘
 ```
 
@@ -72,15 +72,16 @@ VPCE 和 IAM 角色。
 | `80-transport-compare.sh` | 透传 vs InvokeModel 对比（§4） |
 | `90-teardown.sh` | 按依赖顺序拆除（默认 dry-run，`CONFIRM=yes` 才删） |
 
-从零到 10 条路由全通约 1.5 小时（EKS 建集群 12 分钟，其余是等端点 available）。运行成本约 $0.5/小时（EKS $0.10、2 节点 ~$0.17、
-9 个接口端点 × 2 AZ ~$0.20，模型调用另计）。
+本次从零到 10 条路由全通实际用了约 2 小时（含排错；EKS 建集群本身 11 分钟，其余主要是等端点 available 和节点拉起）。
+运行成本是按公开价目的估算，未对账单：约 $0.5/小时（EKS $0.10、2 个节点 ~$0.17、9 个接口端点 × 2 AZ ~$0.20，模型调用另计）。
 
 ## 2. 网络：无公网出口下怎么到达每个 AWS 服务
 
 ### 2.1 三个基本事实
 
 **事实 1：AWS 服务不在你的 VPC 里。** Bedrock、STS、ECR 的服务器在 AWS 自己的网络，对外是公网 IP。无 IGW/NAT 的 VPC 默认一个都连不上——
-连 EKS 节点都起不来（节点要拉镜像、注册、拿凭证）。所以本环境建了 9 个接口端点 + 1 个网关端点，缺任何一个对应功能就断。
+连 EKS 节点都起不来（节点要拉镜像、注册、拿凭证）。本环境按 EKS Auto Mode 与网关的依赖建了 9 个接口端点 + 1 个网关端点（清单见 §1.1）；
+**没有逐个拆掉验证"缺哪个会断什么"**，清单来自 EKS 文档和 9/3 PoC 的经验。
 
 **事实 2：接口型 VPC Endpoint 是放在你子网里的一张网卡。** 建 Bedrock VPCE 时指定两个子网，AWS 就在每个子网放一张网卡
 （10.1.1.205、10.1.2.94），网卡另一头经 AWS 内部线路直连 Bedrock。对 VPC 里的机器来说，往 10.1.1.205:443 发 HTTPS 就是在调 Bedrock。
@@ -158,8 +159,8 @@ B 账号临时凭证（角色 llmgw-bedrock-xacct）→ 签 Bedrock 请求
 **关键点：跳 1 的 STS client 是 AWS SDK 在 `config.LoadDefaultConfig()` 内部自己创建的，应用代码摸不到它。**
 跳 2 的 client 是应用自己 `sts.NewFromConfig()` 建的。两个 client、两套配置来源。
 
-客户的 bug 就在这：他们把 STS VPCE 地址配给了自己建的那个 client（`BaseEndpoint`），跳 2 走了私网，但跳 1 的 client 没拿到这个设置，
-照旧按默认规则去打公网 STS，无出口即超时。报错栈里失败的是 `AssumeRoleWithWebIdentity`，看上去像 IRSA 坏了。
+按 Odin 10/12 在 operations.md 的记录，客户的 bug 就在这：他们把 STS VPCE 地址配给了自己建的那个 client（`BaseEndpoint`），跳 2 走了私网，
+但跳 1 的 client 没拿到这个设置，照旧按默认规则去打公网 STS，无出口即失败。报错栈里失败的是 `AssumeRoleWithWebIdentity`，看上去像 IRSA 坏了。
 
 ### 3.2 实验设计
 
@@ -174,7 +175,7 @@ B 账号临时凭证（角色 llmgw-bedrock-xacct）→ 签 Bedrock 请求
 
 ### 3.3 十组结果
 
-STS VPCE 在东京、私有 DNS 开（C1–C6）或临时关掉（C7–C8，模拟客户环境）：
+STS VPCE 在东京、私有 DNS 开（C1–C6、C9–C10）或临时关掉（C7–C8，模拟客户环境）。C6 与 C2 配置相同，脚本里分开编号只为单独强调签名区域问题，表中合并：
 
 | # | 场景 | region | 跳 2 BaseEndpoint | AWS_ENDPOINT_URL_STS | 跳 1 实际去向 | 跳 2 | Bedrock | 结果 |
 |---|---|---|---|---|---|---|---|---|
@@ -183,12 +184,13 @@ STS VPCE 在东京、私有 DNS 开（C1–C6）或临时关掉（C7–C8，模�
 | **C3** | **本网关做法** | **ap-northeast-1** | — | — | `sts.ap-northeast-1` → 10.2.1.147 200 | 200 | 经 peering 200 | **✓** |
 | C4 | 本网关漏配 `sts_region` | us-west-2 | — | — | 同 C1 | — | — | ✗ |
 | C5 | Bedrock 写公网域名 | ap-northeast-1 | — | — | 200 | 200 | `bedrock-runtime.us-west-2` 公网 → **8s 超时** | ✗ |
-| C7 | **客户真实形态**：STS VPCE 无私有 DNS，只设 BaseEndpoint | ap-northeast-1 | 东京 VPCE | — | `sts.ap-northeast-1` → **公网 IP** → 8s 超时 | 未到 | — | ✗ |
+| C7 | **客户环境形态**（按 Odin 记录推断：STS VPCE 无私有 DNS），只设 BaseEndpoint | ap-northeast-1 | 东京 VPCE | — | `sts.ap-northeast-1` → **8s 超时**（私有 DNS 已关，域名不再解析到 VPCE） | 未到 | — | ✗ |
 | **C8** | **客户修法**：+ 环境变量 | ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | **✓** |
 | C9 | 客户修法，**代码不设 region**，由 SDK 读 EKS webhook 注入的 `AWS_REGION` | （注入）ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | ✓ |
 | C10 | 同 C9，`AWS_REGION` 改为 us-west-2 | （env）us-west-2 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | **403 SignatureDoesNotMatch** | — | ✗ |
 
-C7 的原始报错，和客户现场一致（Odin 10/12 记进 operations.md 的那一行）：
+C7 的原始报错。与 Odin 10/12 记进 operations.md 的客户现场报错是同一形状（他记的末尾是 `connection reset by peer（或超时）`，
+本环境的 NetworkPolicy 丢包所以表现为超时）：
 
 ```
 operation error STS: AssumeRole, get identity: get credentials: failed to refresh cached credentials,
@@ -196,8 +198,8 @@ failed to retrieve credentials, operation error STS: AssumeRoleWithWebIdentity, 
 request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context deadline exceeded
 ```
 
-读法：最外层 `AssumeRole`（跳 2）失败 ← 因为取不到它要用的凭证 ← 跳 1 `AssumeRoleWithWebIdentity` 打的是**公网域名**。
-对端是公网 IP（`44.248.101.77` 一类）就是私有 DNS 没生效或没开。
+读法：最外层 `AssumeRole`（跳 2）失败 ← 因为取不到它要用的凭证 ← 跳 1 `AssumeRoleWithWebIdentity` 打的是 `sts.<region>.amazonaws.com`
+这个**服务公网域名**而不是 VPCE 专属域名。此时在 Pod 里 `getent hosts` 该域名，若得到公网 IP 就是私有 DNS 没开或没生效。
 
 ### 3.4 三个结论
 
@@ -220,7 +222,7 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 - 把 `AWS_REGION` 强行改成 us-west-2 后：`provider setup failed err=provider "bedrock-usw2-xacct": resolve aws credentials: request canceled,
   context deadline exceeded`，20 秒后进程退出。启动即失败、日志直指 provider，不会带病运行。
 
-两层保险（显式配置 + 环境回退）对客户的意义：他们的代码一层都没有，全靠 SDK 默认行为和环境变量的巧合。
+两层保险（显式配置 + 环境回退）对客户的意义：按 Odin 的转述，客户代码没有单独的 STS 区域配置，依赖 SDK 默认 region——这一点我们没看过代码，请 Odin 核对。
 
 ## 4. 客户的做法 vs 本网关：区别与建议
 
@@ -250,9 +252,9 @@ Bedrock 在同一个主机 `bedrock-runtime.<region>.amazonaws.com` 上提供两
 | | Bedrock 原生 API `InvokeModel` | 协议兼容端点 |
 |---|---|---|
 | URL | `/model/<id>/invoke(-with-response-stream)` | `/anthropic/v1/messages`、`/openai/v1/chat/completions`、`/openai/v1/responses` |
-| 请求体 | Bedrock 自己定义（Claude 要 `anthropic_version`，不能带 `model`/`stream`） | 与 Anthropic / OpenAI 官方 API 一字不差 |
+| 请求体 | Bedrock 自己定义（Claude 要 `anthropic_version`，不能带 `model`；非流式不能带 `stream:true`——Odin 9/23 实测，见 operations.md） | 与 Anthropic / OpenAI 官方 API 同格式 |
 | 流式响应 | AWS 二进制 event stream | 标准 SSE |
-| 有 AWS SDK 封装吗 | 有（`bedrockruntime`） | 没有——它是给 Anthropic/OpenAI 的 SDK 用的，那两家 SDK 不做 SigV4 |
+| 有 AWS SDK 封装吗 | 有（`bedrockruntime`） | 没有。本网关用 Go 标准库发 HTTP，签名用 `aws-sdk-go-v2` 的 signer 组件自己做（`sigv4.go`） |
 
 **客户的做法**：解析客户端 JSON → 装进 SDK 结构 → `InvokeModel` → 解 event stream → 重组 SSE 回客户端。
 **本网关默认做法（透传）**：只改 `model` 字段 → 自己 SigV4 → POST 到兼容端点 → 响应字节原样回客户端，旁路抽 usage。
@@ -276,8 +278,8 @@ InvokeModel 发给 Bedrock：
 | **端点配错时的报错**（指到可达但不是 bedrock-runtime 的私网主机） | 404 `<UnknownOperationException/>`，上游原文 | 404 `deserialization failed … invalid character '<' looking for beginning of value` | SDK 硬按 JSON 解析 XML；**从报错看不出是端点错**。Odin operations.md 排障表那一行的实证 |
 | 流式 TTFT p50（各 6 次） | Claude 1094ms / GPT 582ms | Claude 1076ms / GPT 549ms | 差 20–30ms，噪声级 |
 | usage 计量 | 16/10、13/9 | 完全相同 | event stream 还原为 SSE 后计量路径复用 |
-| 客户端收到的流 | 标准 Anthropic SSE | 逐帧一致 | 对客户端透明 |
-| 新字段 / 新 beta | 自动通过 | 取决于 body 改写是否覆盖 | 多一层改写 = 多一处要跟 Bedrock 规则同步 |
+| 客户端收到的流 | 标准 Anthropic SSE | 前几帧（message_start / content_block_start…）格式一致（T4 只比对了开头，未逐帧全量比对） | 对客户端透明 |
+| 新字段 / 新 beta | 原样转发 | 取决于 body 改写是否覆盖 | **推断，未实测**：多一层改写 = 多一处要跟 Bedrock 规则同步 |
 | 凭证 / STS | 网关 `sts_region` + 私有 DNS | 复用同一凭证链（`bedrock_invoke` 实现如此）；**客户自己的 SDK 代码没有这层**，即 §3 的坑 | |
 
 ### 4.3 对"客户要不要改"的建议（供 Odin 定稿）
@@ -302,13 +304,13 @@ InvokeModel 发给 Bedrock：
 | `deserialization failed … invalid character '<'` | SDK 的 Bedrock 端点指到了不是 bedrock-runtime 的主机 | T2 | 端点改为 `bedrock-runtime.<region>…` 或其 VPCE 专属域名 |
 | `does not serve openai_responses`（本网关）/ `ValidationException … missing field 'messages'`（SDK 网关直发） | Responses body 走到了 InvokeModel 路径 | T1 / T1b | 路由加 `providerProtocol: openai_chat`；SDK 网关需先把 Responses 转成 Chat |
 | 网关启动 `provider setup failed … resolve aws credentials: context deadline exceeded` | 本网关漏配 `sts_region` 且 `AWS_REGION` 不是 VPCE 区域 | 75 | 补 `sts_region` |
-| Pod 起不来 / 拉不到镜像 | 缺 ecr.api / ecr.dkr / s3 / ec2 / eks / eks-auth 端点 | 建环境时 | 对照 §1.1 端点清单 |
+| Pod 起不来 / 拉不到镜像 | 缺 ecr.api / ecr.dkr / s3 / ec2 / eks / eks-auth 端点 | 未实测（本环境一次建齐） | 对照 §1.1 端点清单 |
 
 ## 6. 真实客户端验收（跨账号、经 peering）
 
 | 客户端 | 路由 | 结果 |
 |---|---|---|
-| Claude Code → `/v1/messages` | `providerProtocol: openai_chat` → B 的 gpt-5.6-sol | 3 轮（首问→Read 工具→结果→回答）全 200，答案正确 |
+| Claude Code → `/v1/messages` | `providerProtocol: openai_chat` → B 的 gpt-5.6-sol | 多轮（含 Read 工具调用与结果回传）全 200，答案正确 |
 | Codex → `/v1/responses` | `providerProtocol: anthropic` → B 的 claude-sonnet-5 | 2 轮（exec_command→结果→回答）全 200，答案正确 |
 | curl 10 条路由 | 同账号 / 跨账号原生 / 跨账号 InvokeModel / 转换 / 两级故障转移 | 全 200，usage 完整 |
 
