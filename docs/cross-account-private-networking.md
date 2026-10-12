@@ -70,6 +70,7 @@ VPCE 和 IAM 角色。
 | `70-sts-experiments.sh` / `tools/stsprobe` | STS 两跳实验（§3） |
 | `75-gateway-no-sts-region.sh` | 真网关漏配 `sts_region` 的对照（§3.5） |
 | `80-transport-compare.sh` | 透传 vs InvokeModel 对比（§4） |
+| `90-teardown.sh` | 按依赖顺序拆除（默认 dry-run，`CONFIRM=yes` 才删） |
 
 从零到 10 条路由全通约 1.5 小时（EKS 建集群 12 分钟，其余是等端点 available）。运行成本约 $0.5/小时（EKS $0.10、2 节点 ~$0.17、
 9 个接口端点 × 2 AZ ~$0.20，模型调用另计）。
@@ -99,7 +100,7 @@ VPCE 和 IAM 角色。
 私有 DNS 的实现是给 VPCE 所在的 VPC 挂一个私有 hosted zone，所以**它不跨 VPC、不跨 peering**。东京 VPC 里的 Proxy 解析
 `bedrock-runtime.us-west-2.amazonaws.com`，问的是东京 VPC 的解析器，B 那条私有 DNS 规则对它不存在。
 
-**实测**（探针在私有节点、与网关同出向策略下跑，实验 N）：
+**实测**（实验 N1：`60-netprobe.sh`，探针在私有节点、与网关同出向策略下跑）：
 
 ```
 resolve sts.ap-northeast-1.amazonaws.com                 10.2.1.147 10.2.2.180      ← 东京 VPCE，私有 DNS 生效
@@ -178,11 +179,10 @@ STS VPCE 在东京、私有 DNS 开（C1–C6）或临时关掉（C7–C8，模�
 | # | 场景 | region | 跳 2 BaseEndpoint | AWS_ENDPOINT_URL_STS | 跳 1 实际去向 | 跳 2 | Bedrock | 结果 |
 |---|---|---|---|---|---|---|---|---|
 | C1 | 客户失败形态（区域=Bedrock 区域） | us-west-2 | 东京 VPCE | — | `sts.us-west-2` 公网 → **8s 超时** | 未到 | — | ✗ |
-| C2 | 客户修法但区域没改 | us-west-2 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | **403 `SignatureDoesNotMatch: Credential should be scoped to a valid region`** | — | ✗ |
+| C2/C6 | 客户修法但区域没改 | us-west-2 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | **403 `SignatureDoesNotMatch: Credential should be scoped to a valid region`** | — | ✗ |
 | **C3** | **本网关做法** | **ap-northeast-1** | — | — | `sts.ap-northeast-1` → 10.2.1.147 200 | 200 | 经 peering 200 | **✓** |
 | C4 | 本网关漏配 `sts_region` | us-west-2 | — | — | 同 C1 | — | — | ✗ |
 | C5 | Bedrock 写公网域名 | ap-northeast-1 | — | — | 200 | 200 | `bedrock-runtime.us-west-2` 公网 → **8s 超时** | ✗ |
-| C6 | = C2，单列强调签名区域 | | | | | | | ✗ |
 | C7 | **客户真实形态**：STS VPCE 无私有 DNS，只设 BaseEndpoint | ap-northeast-1 | 东京 VPCE | — | `sts.ap-northeast-1` → **公网 IP** → 8s 超时 | 未到 | — | ✗ |
 | **C8** | **客户修法**：+ 环境变量 | ap-northeast-1 | 东京 VPCE | 东京 VPCE | 东京 VPCE 200 | 200 | 200 | **✓** |
 
@@ -219,9 +219,26 @@ request send failed, Post "https://sts.ap-northeast-1.amazonaws.com/": context d
 
 两层保险（显式配置 + 环境回退）对客户的意义：他们的代码一层都没有，全靠 SDK 默认行为和环境变量的巧合。
 
-## 4. 透传 vs SDK InvokeModel
+## 4. 客户的做法 vs 本网关：区别与建议
 
-### 4.1 两种方式是什么
+> 关于客户做法的描述来自 Odin 的转述（"没有做模型透传，是转换成 Go SDK 重新封装一次再发出去"）和他在本仓库按同一方式复刻的
+> `bedrock_invoke` 路径，以及上周现场的报错文本。**我们没有看过客户的代码**，下面凡是"客户……"的表述请 Odin 按实际核对。
+
+### 4.0 一览
+
+| 维度 | 客户做法（SDK 网关） | 本网关 | 区别的后果 | 建议 |
+|---|---|---|---|---|
+| 到 Bedrock 的传输 | AWS SDK `InvokeModel` / `InvokeModelWithResponseStream`：改写 body、解二进制 event stream 再组 SSE | 透传 Bedrock 的协议兼容端点：只改 `model`，自己 SigV4，响应字节原样回 | 性能、计量无差（T3）；但 InvokeModel 不收 Responses 协议（T1）、端点错配时报错误导（T2）、新字段依赖改写覆盖 | **可不改**。架构能跑；下面三条单独处理 |
+| 跨账号 STS | 自建 STS client 设 `BaseEndpoint`，跳 1 没覆盖；修后靠 `AWS_ENDPOINT_URL_STS` | `sts_region` 字段钉区域 + STS VPCE 私有 DNS，两跳自动走内网；回退链兜底 | 客户当前能跑是因为 Pod 的 `AWS_REGION` 恰好是东京；换区域部署或没开私有 DNS 就再卡（C1/C2/C7） | **必须改**：STS 的 region 显式钉到 VPCE 区域；开私有 DNS 或保留环境变量 |
+| 多协议 / 协议转换 | 推断只接 Chat（InvokeModel 的限制）；Responses 客户端无法服务 | 三种协议原生直通；路由字段 `providerProtocol` 可六向互转（Claude Code→GPT、Codex→Claude 已真机验收） | 有 Codex 类用户时客户网关会 400/502 | **建议改**：至少加 Responses→Chat 转换，或参考本仓库 `internal/protocol/translate` |
+| 计量来源 | 从 SDK 解出的 event stream 里取 usage（推断） | 从上游原始字节解析，与透传该协议时一致 | 本网关的 `bedrock_invoke` 把 event stream 还原成 SSE 后复用同一计量代码，实测两条路 usage 相同 | 核对客户计量是否覆盖所有协议的 usage 字段 |
+| 上游错误 | SDK 包装后的错误文本（`deserialization failed … '<'`） | 透传上游原文（`<UnknownOperationException/>`） | 排障时间 | 排障表 §5 给客户 |
+| 配置模型 | 一个 region 决定一切，靠环境变量打补丁 | `region` / `sts_region` / `endpoints` 三个字段分管签名区域、STS 区域、地址 | 跨区域跨账号时三件事必须分别对齐（§3.4） | 文档化三个旋钮 |
+| 跨账号角色权限 | 未知 | 含 `project/default` | 缺它则 Responses 跨账号 401，Messages/Chat 正常（9/3 PoC 对端就是这样） | 提醒客户 B 账号角色加 `arn:aws:bedrock:*:*:project/default` |
+
+一句话给 Odin：**传输方式不必推翻，STS 配法必须改，协议覆盖建议补。** 展开见 §4.3。
+
+### 4.1 两种传输方式是什么
 
 Bedrock 在同一个主机 `bedrock-runtime.<region>.amazonaws.com` 上提供两套 API：
 
@@ -260,10 +277,10 @@ InvokeModel 发给 Bedrock：
 
 ### 4.3 对"客户要不要改"的建议（供 Odin 定稿）
 
-不必劝客户整体重写——InvokeModel 路径能跑、性能无差、计量一致。但有三点值得明确告诉他们：
+**架构层面不必劝客户重写**——InvokeModel 路径能跑、性能无差、计量一致，推翻它的收益不够。**但凭证这一段代码必须改**，另外两点建议补：
 
-1. **STS 两跳**（§3.4 第 1、2 条）是必须改的，否则换个部署形态（`AWS_REGION` 不是东京、或 STS VPCE 私有 DNS 没开）就会再次卡住。
-   最省事的是：STS VPCE 开私有 DNS + 用于 STS 的 region 钉到东京；不开私有 DNS 就用 `AWS_ENDPOINT_URL_STS` 且 region 仍钉东京。
+1. **STS 两跳**（§3.4 第 1、2 条）：现在能跑是巧合（Pod 的 `AWS_REGION` 恰好是东京），换个部署形态（`AWS_REGION` 不是东京、或 STS VPCE 私有 DNS 没开）就会再次卡住。
+   最省事的是：STS VPCE 开私有 DNS + 用于 STS 的 region 显式钉到东京；不开私有 DNS 就用 `AWS_ENDPOINT_URL_STS` 且 region 仍钉东京。
 2. **Responses 协议走不了 InvokeModel**。有 Codex 类用户就要在网关里做 Responses→Chat 转换（本网关的 `providerProtocol: openai_chat`）。
 3. **端点配错时 SDK 的报错具有误导性**（`invalid character '<'`）。排障时看 RequestID 是否 UUID（到了某个 AWS 服务）、模型 ID 错是 400 JSON 不是这个。
 
@@ -290,10 +307,12 @@ InvokeModel 发给 Bedrock：
 | Codex → `/v1/responses` | `providerProtocol: anthropic` → B 的 claude-sonnet-5 | 2 轮（exec_command→结果→回答）全 200，答案正确 |
 | curl 10 条路由 | 同账号 / 跨账号原生 / 跨账号 InvokeModel / 转换 / 两级故障转移 | 全 200，usage 完整 |
 
-## 7. 给 Odin 的备注
+## 7. 备注
 
 - Odin 10/12 文档里的 `AWS_ENDPOINT_URL_STS` 建议正确，但要补一句"region 也要是 VPCE 所在区域"（C2/C6 的 403）。
 - 实验 75 显示本网关在 EKS 上即使漏配 `sts_region` 也能靠 webhook 注入的 `AWS_REGION` 兜住；要不要把这一点写进 configuration.md 的 `sts_region` 说明？
-- B 账号的角色权限里加了 `project/default`，所以跨账号 `/v1/responses` 是 200；9/3 PoC 对端缺这条导致 401，可一并提醒客户。
-- 环境仍在运行可随时复跑；拆除脚本待写（整体删 CloudFormation 栈 + 两个 VPC 下资源）。
+- 本次 B 账号的跨账号角色权限里含 `arn:aws:bedrock:*:*:project/default`，所以跨账号 `/v1/responses` 实测 200——这是第一次在跨账号路径上
+  验证到 Responses 通。你 9/3 PoC 的对端账号（别人管理的那个 Bedrock 账号）角色缺这条，导致 Messages/Chat 200 而 Responses 401
+  （private-networking.md §六、CHANGELOG 9/28 都记过）。客户的 B 账号通常也是另一个团队管，建议在最终文档里单列提醒。
+- 环境仍在运行可随时复跑；`90-teardown.sh` 已写好未执行，拆除顺序：k8s 负载 → EKS 栈 → A 的端点/peering/VPC → B 的端点/角色/VPC → ECR。
 - 本稿未写：IAM 策略原文、NetworkPolicy 原文、EKS Auto Mode 私有节点池细节——这些 `private-networking.md` 已有，最终版可引用或合并。
