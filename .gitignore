@@ -10,3 +10,4 @@
 
 # 本地代码审查工作清单，不进仓库（评审结论放 MR 描述）
 /CODE-REVIEW.md
+/deploy/xacct-lab/out/
